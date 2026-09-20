@@ -4,6 +4,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import streamlit as st
+import engine as engine_mod
 
 from engine import (
     Quarter,
@@ -420,8 +421,86 @@ def build_frozen_oos_tables(event: pd.DataFrame, episode_gap_days: int=10):
     )
 
 
+
+# --- v0.12: replica storica indipendente con regole congelate ---
+HIST_START = pd.Timestamp("2006-01-01")
+HIST_END = pd.Timestamp("2021-12-31")
+HIST_CONFIGS = [
+    ("A · FIRST_CLUSTER ≥2 insider", 2, None),
+    ("B · FIRST_CLUSTER ≥3 insider", 3, None),
+    ("C · ≥3 insider + $100k–250k", 3, "$100k–250k"),
+]
+
+
+def build_historical_replication_tables(event: pd.DataFrame, episode_gap_days: int = 10):
+    """Apply only the three pre-declared rules to 2006-2021; no retuning allowed."""
+    d = normalize_loaded_event_study(event)
+    d = d[pd.to_datetime(d["signal_date"], errors="coerce").between(HIST_START, HIST_END, inclusive="both")].copy()
+    summaries, boots, counts, eras = [], [], [], []
+    era_defs = [
+        ("2006–2010", pd.Timestamp("2006-01-01"), pd.Timestamp("2010-12-31")),
+        ("2011–2015", pd.Timestamp("2011-01-01"), pd.Timestamp("2015-12-31")),
+        ("2016–2021", pd.Timestamp("2016-01-01"), pd.Timestamp("2021-12-31")),
+    ]
+    for i, (name, thr, bucket) in enumerate(HIST_CONFIGS):
+        labelled = label_cluster_episodes(d, min_insiders=thr, episode_gap_days=episode_gap_days)
+        enriched = enrich_first_cluster_features(labelled)
+        mask = enriched["analysis_group"].eq("FIRST_CLUSTER")
+        if bucket is not None:
+            mask &= enriched["value_bucket"].astype(str).eq(bucket) & ~enriched["value_review"]
+        selected = enriched[mask].copy()
+        sm = _period_summary(selected, "HISTORICAL 2006–2021", name, (1, 5))
+        if not sm.empty:
+            summaries.append(sm)
+        priced1 = int(pd.to_numeric(selected.get("excess_1"), errors="coerce").notna().sum()) if "excess_1" in selected else 0
+        priced5 = int(pd.to_numeric(selected.get("excess_5"), errors="coerce").notna().sum()) if "excess_5" in selected else 0
+        counts.append({
+            "config": name,
+            "selected_events": int(len(selected)),
+            "selected_issuers": int(selected["issuer_cik"].astype(str).nunique()) if not selected.empty else 0,
+            "priced_1d": priced1,
+            "coverage_1d_%": round(100 * priced1 / len(selected), 2) if len(selected) else np.nan,
+            "priced_5d": priced5,
+            "coverage_5d_%": round(100 * priced5 / len(selected), 2) if len(selected) else np.nan,
+        })
+        b = filtered_first_cluster_bootstrap(enriched, mask, horizons=(1, 5), n_boot=2000, seed=1200 + i)
+        if not b.empty:
+            b.insert(0, "config", name)
+            boots.append(b)
+        for era_name, lo, hi in era_defs:
+            es = selected[pd.to_datetime(selected["signal_date"], errors="coerce").between(lo, hi, inclusive="both")]
+            em = _period_summary(es, era_name, name, (1, 5))
+            if not em.empty:
+                eras.append(em)
+    return (
+        pd.concat(summaries, ignore_index=True) if summaries else pd.DataFrame(),
+        pd.concat(boots, ignore_index=True) if boots else pd.DataFrame(),
+        pd.DataFrame(counts),
+        pd.concat(eras, ignore_index=True) if eras else pd.DataFrame(),
+    )
+
+
+def historical_price_coverage(event: pd.DataFrame) -> pd.DataFrame:
+    d = event.copy()
+    d["signal_date"] = pd.to_datetime(d["signal_date"], errors="coerce")
+    d = d[d["signal_date"].between(HIST_START, HIST_END, inclusive="both")]
+    d["year"] = d["signal_date"].dt.year
+    d["priced"] = pd.to_numeric(d.get("excess_1"), errors="coerce").notna()
+    rows = []
+    for y, g in d.groupby("year"):
+        rows.append({
+            "year": int(y),
+            "events": int(len(g)),
+            "priced": int(g["priced"].sum()),
+            "coverage_%": round(100 * g["priced"].mean(), 2) if len(g) else np.nan,
+            "missing_ticker": int((g.get("price_status", pd.Series(index=g.index, dtype=str)) == "missing_ticker").sum()),
+            "missing_price": int((g.get("price_status", pd.Series(index=g.index, dtype=str)) == "missing_price").sum()),
+            "stale_symbol_or_gap": int((g.get("price_status", pd.Series(index=g.index, dtype=str)) == "stale_symbol_or_gap").sum()),
+        })
+    return pd.DataFrame(rows)
+
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.11")
+st.title("Independent Insider Radar — v0.12")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -493,7 +572,7 @@ with st.sidebar:
                 st.error(f"Event Study CSV non valido: {exc}")
 
 st.info(
-    "Regola v0.9: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
+    "Regola base: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
     "common/ordinary shares, prezzo e quantità positivi. I filing con più reporting owner vengono "
     "scartati perché il dataset piatto SEC non attribuisce ogni riga transazione a uno specifico owner."
 )
@@ -647,7 +726,7 @@ if isinstance(summary, pd.DataFrame) and not summary.empty:
     })
     st.dataframe(pretty, use_container_width=True, hide_index=True)
     st.info(
-        "v0.9 aggiunge FIRST_CLUSTER vs REPEAT_CLUSTER e bootstrap a livello issuer. "
+        "L’analisi distingue FIRST_CLUSTER vs REPEAT_CLUSTER e usa bootstrap a livello issuer. "
         "La finestra di episodio sotto non cambia la finestra transazioni SEC originaria: decide solo quando due trigger cluster appartengono allo stesso episodio."
     )
     if isinstance(event, pd.DataFrame):
@@ -983,3 +1062,285 @@ if isinstance(event_adv, pd.DataFrame) and not event_adv.empty:
             "La prossima conferma dovrà arrivare da dati separati che non useremo per scegliere ulteriori filtri."
         )
 
+
+
+# --- Historical Replication 2006-2021 (frozen rules) ---
+st.divider()
+st.header("Replica storica indipendente 2006–2021 — v0.12")
+st.info(
+    "Test realmente separato dal periodo 2022–2026 usato per esplorare le regole. "
+    "Le configurazioni sono congelate: A = FIRST_CLUSTER ≥2; B = FIRST_CLUSTER ≥3; "
+    "C = FIRST_CLUSTER ≥3 con controvalore aggregato $100k–250k. "
+    "Finestra SEC ±10 giorni, nuovo episodio dopo 10 giorni, componenti ≥$10k, solo Officer/Director, esclusione 10b5-1 quando marcato, ingresso OPEN prima seduta successiva, orizzonti 1 e 5 sedute."
+)
+st.warning(
+    "Non modificare le regole in base al risultato 2006–2021. Se una configurazione non replica, la consideriamo non stabile invece di cercare una nuova soglia che funzioni sullo storico."
+)
+
+HIST_DIR = Path("data/historical_replication_v0_12")
+HIST_DIR.mkdir(parents=True, exist_ok=True)
+HIST_COMPONENT_DIR = HIST_DIR / "components"
+HIST_COMPONENT_DIR.mkdir(parents=True, exist_ok=True)
+HIST_SIGNALS_PATH = HIST_DIR / "insider_signals_2006_2021.csv"
+HIST_EVENT_PATH = HIST_DIR / "insider_event_study_2006_2021.csv"
+HIST_META_PATH = HIST_EVENT_PATH.with_suffix(HIST_EVENT_PATH.suffix + ".meta.json")
+HIST_QUARTERS = quarter_range(2006, 1, 2021, 4)
+
+local_hist_zips = [DATA_DIR / q.filename for q in HIST_QUARTERS if (DATA_DIR / q.filename).exists()]
+hc1, hc2, hc3, hc4 = st.columns(4)
+hc1.metric("Trimestri SEC storici", f"{len(local_hist_zips)}/64")
+hc2.metric("Componenti trimestrali", f"{len(list(HIST_COMPONENT_DIR.glob('*.csv')))}/64")
+hc3.metric("Segnali storici salvati", "Sì" if HIST_SIGNALS_PATH.exists() else "No")
+hc4.metric("Checkpoint Yahoo", "Sì" if HIST_EVENT_PATH.exists() else "No")
+
+h1, h2 = st.columns(2)
+with h1:
+    if st.button("H1. Scarica / aggiorna SEC 2006–2021", use_container_width=True):
+        if not email or "@" not in email:
+            st.error("Inserisci prima una email valida nel campo User-Agent SEC.")
+        else:
+            bar = st.progress(0.0)
+            status = st.empty()
+            errors = []
+            for i, q in enumerate(HIST_QUARTERS, start=1):
+                try:
+                    download_quarter(q, DATA_DIR, email)
+                except Exception as exc:
+                    errors.append(f"{q.label}: {exc}")
+                bar.progress(i / len(HIST_QUARTERS))
+                status.caption(f"SEC storico: {i}/{len(HIST_QUARTERS)} • {q.label}")
+            if errors:
+                st.error("Alcuni trimestri non sono stati scaricati:\n" + "\n".join(errors[:12]))
+            else:
+                st.success("Tutti i 64 trimestri SEC 2006–2021 sono disponibili.")
+
+with h2:
+    if st.button("H2. Costruisci segnali storici congelati", use_container_width=True):
+        paths = [DATA_DIR / q.filename for q in HIST_QUARTERS]
+        missing = [q.label for q, pth in zip(HIST_QUARTERS, paths) if not pth.exists()]
+        if missing:
+            st.error(f"Mancano {len(missing)} trimestri SEC. Esegui prima H1. Primi mancanti: {', '.join(missing[:8])}")
+        else:
+            bar = st.progress(0.0)
+            status = st.empty()
+            for i, (q, pth) in enumerate(zip(HIST_QUARTERS, paths), start=1):
+                comp_path = HIST_COMPONENT_DIR / f"{q.label}.csv"
+                if not comp_path.exists() or comp_path.stat().st_size < 20:
+                    s_q, o_q, t_q = engine_mod.load_quarter(pth)
+                    comp_q = engine_mod.build_components(
+                        s_q, o_q, t_q,
+                        managers_only=True,
+                        drop_joint_filings=True,
+                        exclude_10b5_1=True,
+                        min_trade_value=10_000,
+                    )
+                    comp_q.to_csv(comp_path, index=False)
+                    del s_q, o_q, t_q, comp_q
+                bar.progress(i / len(HIST_QUARTERS))
+                status.caption(f"Componenti congelati: {i}/{len(HIST_QUARTERS)} • {q.label}")
+            with st.spinner("Unisco i componenti e costruisco i segnali point-in-time..."):
+                frames = []
+                for q in HIST_QUARTERS:
+                    f = pd.read_csv(HIST_COMPONENT_DIR / f"{q.label}.csv", low_memory=False)
+                    for dc in ["FILING_DATE", "TRANS_DATE"]:
+                        f[dc] = pd.to_datetime(f[dc], errors="coerce")
+                    frames.append(f)
+                comp = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                if not comp.empty:
+                    dedupe = ["ISSUERCIK", "RPTOWNERCIK", "TRANS_DATE", "shares", "trade_value", "DIRECT_INDIRECT_OWNERSHIP"]
+                    comp = comp.sort_values("FILING_DATE").drop_duplicates(dedupe, keep="first").reset_index(drop=True)
+                    hist_signals = build_issuer_day_signals(comp, window_days=10, min_insiders=2)
+                    hist_signals = hist_signals[pd.to_datetime(hist_signals["signal_date"], errors="coerce").between(HIST_START, HIST_END, inclusive="both")]
+                    hist_signals.to_csv(HIST_SIGNALS_PATH, index=False)
+                    st.session_state["hist_signals_v012"] = hist_signals
+                    st.success(f"Segnali storici costruiti: {len(hist_signals):,}")
+                del frames, comp
+
+st.subheader("Backtest storico Yahoo con checkpoint")
+st.caption(
+    "Il test 2006–2021 può richiedere tempo e Yahoo non conserva necessariamente tutti i ticker delistati. "
+    "La v0.12 salva ogni blocco completato: se Streamlit si riavvia, il pulsante H3 riprende dal checkpoint invece di ricominciare da zero."
+)
+
+uploaded_hist_event = st.file_uploader(
+    "Oppure carica un insider_event_study_2006_2021.csv già completato",
+    type=["csv"], key="hist_event_upload_v012"
+)
+if uploaded_hist_event is not None and st.button("Usa Event Study storico caricato", key="use_hist_event_v012"):
+    try:
+        hev = normalize_loaded_event_study(pd.read_csv(uploaded_hist_event, low_memory=False))
+        st.session_state["hist_event_v012"] = hev
+        st.success(f"Event Study storico caricato: {len(hev):,} righe.")
+    except Exception as exc:
+        st.error(f"CSV storico non compatibile: {exc}")
+
+h3a, h3b = st.columns([3, 1])
+with h3a:
+    if st.button("H3. Esegui / riprendi Event Study storico 1/5 sedute", use_container_width=True):
+        if not HIST_SIGNALS_PATH.exists():
+            st.error("Prima costruisci i segnali storici con H2.")
+        elif not hasattr(engine_mod, "backtest_signals_checkpointed"):
+            st.error("engine.py non è aggiornato alla v0.12. Sostituisci insieme app.py ed engine.py.")
+        else:
+            hist_signals = normalize_loaded_signals(pd.read_csv(HIST_SIGNALS_PATH, low_memory=False))
+            pbar = st.progress(0.0)
+            pbox = st.empty()
+            def _hist_progress(done, total, rows_done, rows_total):
+                pbar.progress(min(done / max(total, 1), 1.0))
+                pbox.caption(f"Yahoo storico: blocco {done}/{total} • checkpoint {rows_done:,}/{rows_total:,} eventi")
+            try:
+                with st.spinner("Backtest storico a blocchi; i risultati vengono salvati dopo ogni batch..."):
+                    hev, hsum = engine_mod.backtest_signals_checkpointed(
+                        hist_signals,
+                        HIST_EVENT_PATH,
+                        horizons=(1, 5),
+                        batch_size=40,
+                        max_entry_lag_days=7,
+                        progress_callback=_hist_progress,
+                    )
+                st.session_state["hist_event_v012"] = normalize_loaded_event_study(hev)
+                pbar.progress(1.0)
+                pbox.success("Checkpoint storico aggiornato/completato.")
+            except Exception as exc:
+                st.error(f"Event Study storico interrotto: {exc}")
+with h3b:
+    if st.button("Azzera checkpoint Yahoo", use_container_width=True):
+        for pp in [HIST_EVENT_PATH, HIST_META_PATH]:
+            try:
+                if pp.exists(): pp.unlink()
+            except Exception:
+                pass
+        st.session_state.pop("hist_event_v012", None)
+        st.success("Checkpoint storico azzerato.")
+
+if HIST_SIGNALS_PATH.exists():
+    try:
+        _hs_n = sum(1 for _ in open(HIST_SIGNALS_PATH, "rb")) - 1
+        st.caption(f"Segnali storici su disco: {_hs_n:,}")
+        st.download_button(
+            "Scarica segnali storici 2006–2021",
+            HIST_SIGNALS_PATH.read_bytes(),
+            file_name="insider_signals_2006_2021.csv",
+            mime="text/csv",
+        )
+    except Exception:
+        pass
+if HIST_EVENT_PATH.exists():
+    try:
+        st.download_button(
+            "Scarica checkpoint/Event Study storico",
+            HIST_EVENT_PATH.read_bytes(),
+            file_name="insider_event_study_2006_2021.csv",
+            mime="text/csv",
+        )
+    except Exception:
+        pass
+
+hist_event = st.session_state.get("hist_event_v012")
+if hist_event is None and HIST_EVENT_PATH.exists():
+    # Do not auto-load a potentially large file on every rerun; user can explicitly analyze it.
+    if st.button("H4. Carica checkpoint e analizza le regole congelate", use_container_width=True):
+        try:
+            hist_event = normalize_loaded_event_study(pd.read_csv(HIST_EVENT_PATH, low_memory=False))
+            st.session_state["hist_event_v012"] = hist_event
+        except Exception as exc:
+            st.error(f"Impossibile leggere il checkpoint storico: {exc}")
+
+hist_event = st.session_state.get("hist_event_v012")
+if isinstance(hist_event, pd.DataFrame) and not hist_event.empty:
+    total_expected = None
+    if HIST_SIGNALS_PATH.exists():
+        try:
+            total_expected = sum(1 for _ in open(HIST_SIGNALS_PATH, "rb")) - 1
+        except Exception:
+            total_expected = None
+    st.subheader("Risultato replica storica — regole congelate")
+    if total_expected is not None and len(hist_event) < total_expected:
+        st.warning(f"Checkpoint ancora parziale: {len(hist_event):,}/{total_expected:,} eventi. Completa H3 prima di interpretare i risultati.")
+    else:
+        coverage = historical_price_coverage(hist_event)
+        if not coverage.empty:
+            st.markdown("**Copertura Yahoo per anno**")
+            st.dataframe(coverage, use_container_width=True, hide_index=True)
+        with st.spinner("Bootstrap issuer-level delle tre configurazioni congelate..."):
+            hsum, hboot, hcounts, heras = build_historical_replication_tables(hist_event, episode_gap_days=10)
+        if not hcounts.empty:
+            st.markdown("**Campioni e copertura delle configurazioni congelate**")
+            st.dataframe(hcounts, use_container_width=True, hide_index=True)
+        if not hsum.empty:
+            hp = hsum.copy()
+            for c in ["mean_excess", "trimmed_mean_excess_1pct", "median_excess", "win_rate_excess"]:
+                hp[c] = (hp[c] * 100).round(2)
+            hp = hp.rename(columns={
+                "mean_excess":"mean_excess_%",
+                "trimmed_mean_excess_1pct":"trimmed_mean_1pct_%",
+                "median_excess":"median_excess_%",
+                "win_rate_excess":"win_rate_excess_%",
+            })
+            st.markdown("**Replica 2006–2021: 1 e 5 sedute**")
+            st.dataframe(hp, use_container_width=True, hide_index=True)
+        if not hboot.empty:
+            bp = hboot.copy()
+            for c in ["observed_diff", "ci95_low", "ci95_high"]:
+                bp[c] = (bp[c] * 100).round(2)
+            bp = bp.rename(columns={
+                "observed_diff":"diff_media_%",
+                "ci95_low":"CI95_low_%",
+                "ci95_high":"CI95_high_%",
+                "robustly_above_zero":"CI_interamente_>0",
+            })
+            st.markdown("**Bootstrap issuer-level: configurazione congelata − SOLO**")
+            keep = [c for c in ["config","horizon_sessions","diff_media_%","CI95_low_%","CI95_high_%","bootstrap_reps","n_selected","n_selected_issuers","CI_interamente_>0"] if c in bp.columns]
+            st.dataframe(bp[keep], use_container_width=True, hide_index=True)
+        if not heras.empty:
+            ep = heras.copy()
+            for c in ["mean_excess", "trimmed_mean_excess_1pct", "median_excess", "win_rate_excess"]:
+                ep[c] = (ep[c] * 100).round(2)
+            ep = ep.rename(columns={
+                "mean_excess":"mean_excess_%",
+                "trimmed_mean_excess_1pct":"trimmed_mean_1pct_%",
+                "median_excess":"median_excess_%",
+                "win_rate_excess":"win_rate_excess_%",
+            })
+            st.markdown("**Diagnostica temporale predefinita (non usata per ottimizzare)**")
+            st.dataframe(ep, use_container_width=True, hide_index=True)
+
+        if not hsum.empty:
+            criteria = []
+            boot_lookup = {}
+            if not hboot.empty:
+                for _, r in hboot.iterrows():
+                    boot_lookup[(r["config"], int(r["horizon_sessions"]))] = bool(r["robustly_above_zero"])
+            for _, r in hsum.iterrows():
+                key = (r["config"], int(r["horizon_sessions"]))
+                criteria.append({
+                    "config": r["config"],
+                    "horizon_sessions": int(r["horizon_sessions"]),
+                    "mean_>0": bool(r["mean_excess"] > 0),
+                    "trimmed_>0": bool(r["trimmed_mean_excess_1pct"] > 0),
+                    "median_>0": bool(r["median_excess"] > 0),
+                    "win_rate_>50%": bool(r["win_rate_excess"] > 0.5),
+                    "CI95_vs_SOLO_>0": boot_lookup.get(key, False),
+                })
+            st.markdown("**Criteri pre-dichiarati: direzione e robustezza**")
+            st.dataframe(pd.DataFrame(criteria), use_container_width=True, hide_index=True)
+
+        export_parts = []
+        if not hsum.empty:
+            x = hsum.copy(); x.insert(0, "table", "summary"); export_parts.append(x)
+        if not hboot.empty:
+            x = hboot.copy(); x.insert(0, "table", "bootstrap"); export_parts.append(x)
+        if not hcounts.empty:
+            x = hcounts.copy(); x.insert(0, "table", "counts"); export_parts.append(x)
+        if export_parts:
+            export = pd.concat(export_parts, ignore_index=True, sort=False)
+            st.download_button(
+                "Scarica replica storica v0.12 CSV",
+                export.to_csv(index=False).encode("utf-8"),
+                file_name="insider_historical_replication_v0_12.csv",
+                mime="text/csv",
+            )
+        st.caption(
+            "Limite strutturale: Yahoo può non avere prezzi per molti ticker delistati/storici. La tabella di copertura è parte integrante del risultato: "
+            "una replica positiva con copertura molto bassa non va interpretata come prova definitiva."
+        )
