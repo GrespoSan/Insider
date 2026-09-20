@@ -417,8 +417,49 @@ def build_issuer_day_signals(
     return pd.DataFrame(results).sort_values(["signal_date", "cluster_value"], ascending=[False, False]).reset_index(drop=True)
 
 
+def _safe_text(value) -> str:
+    """Return a clean string without ever evaluating pd.NA in boolean context."""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _naive_timestamp(value) -> pd.Timestamp:
+    """Normalize any datetime-like value to a tz-naive pandas Timestamp."""
+    t = pd.Timestamp(value)
+    if pd.isna(t):
+        return pd.NaT
+    try:
+        if t.tzinfo is not None:
+            # Strip timezone while preserving the displayed calendar time/date.
+            t = t.tz_localize(None)
+    except Exception:
+        try:
+            t = t.tz_convert(None)
+        except Exception:
+            pass
+    return t
+
+
+def _scalar_float(value) -> float:
+    """Coerce Yahoo cells to one numeric scalar even if duplicate labels return a Series."""
+    if isinstance(value, pd.Series):
+        vals = pd.to_numeric(value, errors="coerce").dropna()
+        return float(vals.iloc[0]) if not vals.empty else float("nan")
+    if isinstance(value, (pd.DataFrame, np.ndarray, list, tuple)):
+        arr = pd.to_numeric(pd.Series(np.asarray(value).ravel()), errors="coerce").dropna()
+        return float(arr.iloc[0]) if not arr.empty else float("nan")
+    try:
+        return float(value)
+    except Exception:
+        return float("nan")
+
+
 def yahoo_symbol(ticker: str) -> str:
-    t = str(ticker or "").strip().upper()
+    t = _safe_text(ticker).upper()
     if t in MISSING_TICKER_VALUES:
         return ""
     return t.replace(".", "-")
@@ -515,7 +556,7 @@ def backtest_signals(
         return signals.copy(), pd.DataFrame()
 
     sig = signals.copy()
-    sig["signal_date"] = pd.to_datetime(sig["signal_date"])
+    sig["signal_date"] = sig["signal_date"].map(_naive_timestamp)
     sig["yahoo_symbol"] = sig["ticker"].map(yahoo_symbol)
 
     valid_symbols = sorted({s for s in sig["yahoo_symbol"].astype(str) if s})
@@ -526,71 +567,92 @@ def backtest_signals(
 
     rows: list[dict] = []
     for _, row in sig.iterrows():
-        sym = str(row["yahoo_symbol"] or "")
-        base = row.to_dict()
-        for h in horizons:
-            base[f"ret_{h}"] = np.nan
-            base[f"spy_{h}"] = np.nan
-            base[f"excess_{h}"] = np.nan
-        if not sym:
-            base["price_status"] = "missing_ticker"
-            rows.append(base)
-            continue
-        px = prices.get(sym, pd.DataFrame())
-        if px.empty or bench.empty:
-            base["price_status"] = "missing_price"
-            rows.append(base)
-            continue
+        try:
+            sym = _safe_text(row.get("yahoo_symbol", ""))
+            base = row.to_dict()
+            for h in horizons:
+                base[f"ret_{h}"] = np.nan
+                base[f"spy_{h}"] = np.nan
+                base[f"excess_{h}"] = np.nan
+            if not sym:
+                base["price_status"] = "missing_ticker"
+                rows.append(base)
+                continue
+            px = prices.get(sym, pd.DataFrame())
+            if px.empty or bench.empty:
+                base["price_status"] = "missing_price"
+                rows.append(base)
+                continue
 
-        entry_candidates = px.index[px.index > pd.Timestamp(row["signal_date"])]
-        if len(entry_candidates) == 0:
-            base["price_status"] = "no_future_session"
-            rows.append(base)
-            continue
-        entry_date = entry_candidates[0]
-        entry_lag_days = int((pd.Timestamp(entry_date) - pd.Timestamp(row["signal_date"])).days)
-        base["entry_lag_days"] = entry_lag_days
-        if entry_lag_days > int(max_entry_lag_days):
+            signal_ts = _naive_timestamp(row.get("signal_date"))
+            if pd.isna(signal_ts):
+                base["price_status"] = "invalid_signal_date"
+                rows.append(base)
+                continue
+            px = px.copy()
+            px.index = pd.DatetimeIndex([_naive_timestamp(x) for x in px.index])
+            bench_local = bench.copy()
+            bench_local.index = pd.DatetimeIndex([_naive_timestamp(x) for x in bench_local.index])
+            entry_candidates = px.index[px.index > signal_ts]
+            if len(entry_candidates) == 0:
+                base["price_status"] = "no_future_session"
+                rows.append(base)
+                continue
+            entry_date = _naive_timestamp(entry_candidates[0])
+            # Compare normalized calendar dates; this avoids tz-aware vs tz-naive TypeError.
+            entry_lag_days = int((entry_date.normalize() - signal_ts.normalize()).days)
+            base["entry_lag_days"] = entry_lag_days
+            if entry_lag_days > int(max_entry_lag_days):
+                base["entry_date"] = entry_date
+                base["price_status"] = "stale_symbol_or_gap"
+                rows.append(base)
+                continue
+            if entry_date not in bench_local.index:
+                base["price_status"] = "benchmark_missing_entry"
+                rows.append(base)
+                continue
+            entry_open = _scalar_float(px.loc[entry_date, "Open"])
+            bench_open = _scalar_float(bench_local.loc[entry_date, "Open"])
+            if not np.isfinite(entry_open) or entry_open <= 0 or not np.isfinite(bench_open) or bench_open <= 0:
+                base["price_status"] = "bad_entry_price"
+                rows.append(base)
+                continue
+
+            loc = px.index.get_loc(entry_date)
             base["entry_date"] = entry_date
-            base["price_status"] = "stale_symbol_or_gap"
+            base["entry_open"] = entry_open
+            base["price_status"] = "ok"
+            for h in horizons:
+                exit_pos = loc + h - 1
+                if exit_pos >= len(px.index):
+                    base[f"ret_{h}"] = np.nan
+                    base[f"spy_{h}"] = np.nan
+                    base[f"excess_{h}"] = np.nan
+                    continue
+                exit_date = px.index[exit_pos]
+                if exit_date not in bench_local.index:
+                    base[f"ret_{h}"] = np.nan
+                    base[f"spy_{h}"] = np.nan
+                    base[f"excess_{h}"] = np.nan
+                    continue
+                stock_close = _scalar_float(px.loc[exit_date, "Close"])
+                spy_close = _scalar_float(bench_local.loc[exit_date, "Close"])
+                ret = stock_close / entry_open - 1.0
+                spy_ret = spy_close / bench_open - 1.0
+                base[f"ret_{h}"] = ret
+                base[f"spy_{h}"] = spy_ret
+                base[f"excess_{h}"] = ret - spy_ret
             rows.append(base)
-            continue
-        if entry_date not in bench.index:
-            base["price_status"] = "benchmark_missing_entry"
-            rows.append(base)
-            continue
-        entry_open = float(px.loc[entry_date, "Open"])
-        bench_open = float(bench.loc[entry_date, "Open"])
-        if not np.isfinite(entry_open) or entry_open <= 0 or not np.isfinite(bench_open) or bench_open <= 0:
-            base["price_status"] = "bad_entry_price"
-            rows.append(base)
-            continue
-
-        loc = px.index.get_loc(entry_date)
-        base["entry_date"] = entry_date
-        base["entry_open"] = entry_open
-        base["price_status"] = "ok"
-        for h in horizons:
-            exit_pos = loc + h - 1
-            if exit_pos >= len(px.index):
-                base[f"ret_{h}"] = np.nan
-                base[f"spy_{h}"] = np.nan
-                base[f"excess_{h}"] = np.nan
-                continue
-            exit_date = px.index[exit_pos]
-            if exit_date not in bench.index:
-                base[f"ret_{h}"] = np.nan
-                base[f"spy_{h}"] = np.nan
-                base[f"excess_{h}"] = np.nan
-                continue
-            stock_close = float(px.loc[exit_date, "Close"])
-            spy_close = float(bench.loc[exit_date, "Close"])
-            ret = stock_close / entry_open - 1.0
-            spy_ret = spy_close / bench_open - 1.0
-            base[f"ret_{h}"] = ret
-            base[f"spy_{h}"] = spy_ret
-            base[f"excess_{h}"] = ret - spy_ret
-        rows.append(base)
+        except Exception as exc:
+            # A malformed Yahoo/SEC row must not abort the full universe. Preserve it for audit.
+            err = row.to_dict()
+            for h in horizons:
+                err.setdefault(f"ret_{h}", np.nan)
+                err.setdefault(f"spy_{h}", np.nan)
+                err.setdefault(f"excess_{h}", np.nan)
+            err["price_status"] = f"row_error_{type(exc).__name__}"
+            err["price_error"] = str(exc)[:240]
+            rows.append(err)
 
     event = pd.DataFrame(rows)
     summary_rows: list[dict] = []
@@ -602,9 +664,9 @@ def backtest_signals(
             lo = x.quantile(0.01)
             hi = x.quantile(0.99)
             trimmed = x[(x >= lo) & (x <= hi)]
-            issuer_count = int(subgroup.loc[x.index, "issuer_cik"].astype(str).nunique())
+            issuer_count = int(subgroup.loc[x.index, "issuer_cik"].astype(str).nunique()) if "issuer_cik" in subgroup.columns else 0
             summary_rows.append({
-                "group": "CLUSTER" if bool(cluster_value) else "SOLO",
+                "group": "CLUSTER" if (not pd.isna(cluster_value) and bool(cluster_value)) else "SOLO",
                 "horizon_sessions": h,
                 "n": int(x.size),
                 "n_issuers": issuer_count,
@@ -617,6 +679,81 @@ def backtest_signals(
             })
     summary = pd.DataFrame(summary_rows)
     return event, summary
+
+
+def normalize_loaded_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate and normalize a previously exported insider_signals CSV.
+
+    This allows the Streamlit app to resume directly from step 3 without rebuilding
+    SEC Form 4 signals. The function is intentionally strict on the columns required
+    by the event study, while preserving any extra audit columns present in the CSV.
+    """
+    if df is None or df.empty:
+        raise ValueError("Il CSV segnali è vuoto.")
+
+    out = df.copy()
+    required = {"signal_date", "ticker", "cluster", "issuer_cik"}
+    missing = sorted(required.difference(out.columns))
+    if missing:
+        raise ValueError("CSV segnali non compatibile. Colonne mancanti: " + ", ".join(missing))
+
+    out["signal_date"] = pd.to_datetime(out["signal_date"], errors="coerce")
+    if out["signal_date"].isna().all():
+        raise ValueError("La colonna signal_date non contiene date valide.")
+
+    # CSV round-trips may turn booleans into strings or 0/1. Normalize explicitly.
+    def _to_bool(v):
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        if pd.isna(v):
+            return False
+        t = str(v).strip().lower()
+        if t in {"true", "1", "yes", "y", "si", "sì"}:
+            return True
+        if t in {"false", "0", "no", "n", ""}:
+            return False
+        raise ValueError(f"Valore booleano non riconosciuto nella colonna cluster: {v!r}")
+
+    out["cluster"] = out["cluster"].map(_to_bool)
+    if "value_review" in out.columns:
+        try:
+            out["value_review"] = out["value_review"].map(_to_bool)
+        except ValueError:
+            out["value_review"] = False
+    else:
+        out["value_review"] = False
+
+    out["ticker"] = out["ticker"].fillna("").astype(str).str.strip().str.upper()
+    if "ticker_status" not in out.columns:
+        out["ticker_status"] = np.where(out["ticker"].isin(MISSING_TICKER_VALUES) | out["ticker"].eq(""), "missing", "ok")
+    else:
+        out["ticker_status"] = out["ticker_status"].fillna("").astype(str)
+
+    # Keep issuer_cik as text to avoid scientific notation / loss of leading zeroes.
+    out["issuer_cik"] = out["issuer_cik"].fillna("").astype(str).str.replace(r"\.0$", "", regex=True)
+
+    # Optional columns used only by the display layer; create safe defaults if absent.
+    defaults = {
+        "issuer_name": "",
+        "n_insiders": 1,
+        "cluster_value": np.nan,
+        "new_filing_value": np.nan,
+        "window_start": pd.NaT,
+        "window_end": pd.NaT,
+        "roles": "",
+        "owners": "",
+        "mean_filing_lag_days": np.nan,
+        "accessions": "",
+    }
+    for col, default in defaults.items():
+        if col not in out.columns:
+            out[col] = default
+
+    for col in ["window_start", "window_end"]:
+        out[col] = pd.to_datetime(out[col], errors="coerce")
+
+    return out.sort_values(["signal_date", "cluster_value"], ascending=[False, False], na_position="last").reset_index(drop=True)
+
 
 def sec_filing_url(accession: str, issuer_cik: str) -> str:
     accession_clean = accession.replace("-", "")

@@ -112,3 +112,58 @@ def test_backtest_accepts_next_session_within_guard(monkeypatch=None):
     assert event.iloc[0].price_status == 'ok'
     assert int(event.iloc[0].entry_lag_days) == 3
     assert abs(event.iloc[0].excess_1 - 0.09) < 1e-12
+
+
+def test_backtest_handles_timezone_mismatch():
+    import engine
+    sig = pd.DataFrame([{
+        'issuer_cik':'1','ticker':'TST','ticker_status':'ok','issuer_name':'Test',
+        'signal_date':pd.Timestamp('2026-01-02', tz='UTC'),'cluster':False,'n_insiders':1,
+        'new_filing_value':10000,'cluster_value':10000,'value_review':False,
+        'window_start':pd.Timestamp('2026-01-02'),'window_end':pd.Timestamp('2026-01-02'),
+        'owners':'Alice','roles':'CEO','mean_filing_lag_days':0.0,'accessions':'A1'
+    }])
+    idx = pd.DatetimeIndex(pd.to_datetime(['2026-01-05','2026-01-06'])).tz_localize('America/New_York')
+    px = pd.DataFrame({'Open':[10,10],'Close':[11,12]}, index=idx)
+    spy = pd.DataFrame({'Open':[100,100],'Close':[101,102]}, index=idx)
+    original = engine._download_yahoo_prices
+    try:
+        engine._download_yahoo_prices = lambda symbols, start, end, batch_size=80: {'TST':px, 'SPY':spy}
+        event, summary = engine.backtest_signals(sig, horizons=(1,), max_entry_lag_days=7)
+    finally:
+        engine._download_yahoo_prices = original
+    assert event.iloc[0].price_status == 'ok'
+    assert int(event.iloc[0].entry_lag_days) == 3
+
+
+def test_yahoo_symbol_handles_pd_na():
+    import engine
+    assert engine.yahoo_symbol(pd.NA) == ''
+
+
+def test_normalize_loaded_signals_csv_roundtrip():
+    import pandas as pd
+    from engine import normalize_loaded_signals
+
+    raw = pd.DataFrame({
+        "signal_date": ["2026-06-30", "2026-06-29"],
+        "ticker": ["aapl", ""],
+        "cluster": ["True", "False"],
+        "issuer_cik": [320193, 123456],
+    })
+    out = normalize_loaded_signals(raw)
+    assert len(out) == 2
+    assert set(out["cluster"].tolist()) == {True, False}
+    assert "AAPL" in set(out["ticker"])
+    assert "ticker_status" in out.columns
+    assert "value_review" in out.columns
+
+
+def test_normalize_loaded_signals_rejects_view_missing_core_column():
+    import pandas as pd
+    import pytest
+    from engine import normalize_loaded_signals
+
+    raw = pd.DataFrame({"signal_date": ["2026-01-01"], "ticker": ["AAPL"], "cluster": [True]})
+    with pytest.raises(ValueError):
+        normalize_loaded_signals(raw)

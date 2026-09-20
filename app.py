@@ -12,10 +12,11 @@ from engine import (
     download_quarter,
     latest_completed_quarter,
     quarter_range,
+    normalize_loaded_signals,
 )
 
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.5")
+st.title("Independent Insider Radar — v0.7")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -41,8 +42,36 @@ with st.sidebar:
     window_days = st.slider("Finestra transazioni (± giorni)", 1, 30, 10)
     min_insiders = st.slider("Insider distinti minimi", 2, 6, 2)
 
+    st.divider()
+    st.header("Riprendi da CSV")
+    uploaded_signals = st.file_uploader(
+        "Carica insider_signals_all.csv",
+        type=["csv"],
+        help="Consente di saltare il passo 2 e andare direttamente all'Event Study.",
+    )
+    if uploaded_signals is not None:
+        if st.button("Usa CSV segnali caricato", use_container_width=True):
+            try:
+                loaded = pd.read_csv(uploaded_signals, low_memory=False)
+                loaded = normalize_loaded_signals(loaded)
+                st.session_state["signals"] = loaded
+                st.session_state["components"] = None
+                st.session_state["signals_source"] = "csv"
+                # A newly loaded signal set invalidates any previous event-study output.
+                st.session_state.pop("event", None)
+                st.session_state.pop("summary", None)
+                st.success(f"Segnali caricati: {len(loaded):,}")
+                if loaded["cluster"].all():
+                    st.warning(
+                        "Il CSV contiene solo righe CLUSTER. Sembra una vista filtrata (es. insider_signals_view.csv): "
+                        "l'Event Study può partire, ma non sarà possibile il confronto SOLO vs CLUSTER. "
+                        "Per il test completo usa insider_signals_all.csv."
+                    )
+            except Exception as exc:
+                st.error(f"CSV non valido: {exc}")
+
 st.info(
-    "Regola v0.5: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
+    "Regola v0.7: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
     "common/ordinary shares, prezzo e quantità positivi. I filing con più reporting owner vengono "
     "scartati perché il dataset piatto SEC non attribuisce ogni riga transazione a uno specifico owner."
 )
@@ -94,14 +123,21 @@ if st.button("2. Costruisci segnali", use_container_width=True):
             )
             st.session_state["components"] = comp
             st.session_state["signals"] = signals
+            st.session_state["signals_source"] = "sec"
+            st.session_state.pop("event", None)
+            st.session_state.pop("summary", None)
 
 signals = st.session_state.get("signals")
 components = st.session_state.get("components")
 
 if isinstance(signals, pd.DataFrame) and not signals.empty:
     st.subheader("Risultato")
+    source = st.session_state.get("signals_source", "sec")
+    if source == "csv":
+        st.success("Segnali caricati da CSV: il passo 2 è stato saltato. Puoi andare direttamente al punto 3.")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Componenti P puliti", f"{len(components):,}")
+    component_count = len(components) if isinstance(components, pd.DataFrame) else None
+    m1.metric("Componenti P puliti", f"{component_count:,}" if component_count is not None else "—")
     m2.metric("Issuer-day pubblici", f"{len(signals):,}")
     m3.metric("Cluster", f"{int(signals['cluster'].sum()):,}")
     valid_cluster_tickers = signals.loc[signals.cluster & signals["ticker"].astype(str).str.strip().ne(""), "ticker"].nunique()
@@ -160,11 +196,13 @@ if isinstance(summary, pd.DataFrame) and not summary.empty:
     if isinstance(event, pd.DataFrame) and not event.empty and "price_status" in event.columns:
         st.subheader("Copertura prezzi Yahoo")
         status = event["price_status"].value_counts(dropna=False)
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Eventi prezzati", f"{int(status.get('ok', 0)):,}")
         c2.metric("Senza ticker", f"{int(status.get('missing_ticker', 0)):,}")
         c3.metric("Prezzo Yahoo mancante", f"{int(status.get('missing_price', 0)):,}")
         c4.metric("Ticker/storico incoerente", f"{int(status.get('stale_symbol_or_gap', 0)):,}")
+        other_errors = int(status[status.index.astype(str).str.startswith("row_error_")].sum()) if len(status) else 0
+        c5.metric("Record anomali", f"{other_errors:,}")
     st.subheader("Sintesi descrittiva")
     pretty = summary.copy()
     for c in ["mean_excess", "trimmed_mean_excess_1pct", "median_excess", "win_rate_excess", "p01_excess", "p99_excess"]:
@@ -180,7 +218,7 @@ if isinstance(summary, pd.DataFrame) and not summary.empty:
     })
     st.dataframe(pretty, use_container_width=True, hide_index=True)
     st.warning(
-        "v0.5 corregge il bias da ticker riutilizzati/storici Yahoo incompleti e mostra anche una media tagliata 1%. "
+        "v0.7 mantiene la guardia anti-ticker riutilizzato/storico Yahoo incompleto e consente di riprendere il lavoro da insider_signals_all.csv. "
         "Le statistiche restano descrittive: la fase successiva deve aggiungere intervalli di confidenza e confronto cluster-vs-solo "
         "con dipendenza per issuer e periodo, oltre a separare il primo trigger di cluster dalle ripetizioni ravvicinate."
     )
