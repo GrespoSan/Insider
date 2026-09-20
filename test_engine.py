@@ -40,3 +40,30 @@ def test_missing_issuer_name_uses_ticker_fallback():
     assert len(sig) == 1
     assert sig.iloc[0].ticker == "MISS"
     assert sig.iloc[0].issuer_name == "MISS"
+
+
+def test_none_ticker_is_preserved_but_marked_missing():
+    rows = [
+        dict(ACCESSION_NUMBER="A1", ISSUERCIK="88", ISSUERNAME="Private-ish", ISSUERTRADINGSYMBOL="",
+             RPTOWNERCIK="801", RPTOWNERNAME="Alice", RPTOWNER_RELATIONSHIP="OFFICER", RPTOWNER_TITLE="CEO",
+             FILING_DATE=pd.Timestamp("2026-02-05"), TRANS_DATE=pd.Timestamp("2026-02-03"),
+             DIRECT_INDIRECT_OWNERSHIP="D", SECURITY_TITLE="Common Stock", shares=100, trade_value=10000,
+             n_tranches=1, vwap=100, filing_lag_days=2),
+    ]
+    sig = build_issuer_day_signals(pd.DataFrame(rows), window_days=10, min_insiders=2)
+    assert len(sig) == 1
+    assert sig.iloc[0].ticker == ""
+    assert sig.iloc[0].ticker_status == "missing"
+    assert sig.iloc[0].issuer_name == "Private-ish"
+
+
+def test_value_review_flag_only_marks_extreme_values():
+    rows = [
+        dict(ACCESSION_NUMBER="A1", ISSUERCIK="99", ISSUERNAME="Big", ISSUERTRADINGSYMBOL="BIG",
+             RPTOWNERCIK="901", RPTOWNERNAME="Alice", RPTOWNER_RELATIONSHIP="OFFICER", RPTOWNER_TITLE="CEO",
+             FILING_DATE=pd.Timestamp("2026-02-05"), TRANS_DATE=pd.Timestamp("2026-02-03"),
+             DIRECT_INDIRECT_OWNERSHIP="D", SECURITY_TITLE="Common Stock", shares=1, trade_value=1_500_000_000,
+             n_tranches=1, vwap=1_500_000_000, filing_lag_days=2),
+    ]
+    sig = build_issuer_day_signals(pd.DataFrame(rows), window_days=10, min_insiders=2)
+    assert bool(sig.iloc[0].value_review) is True

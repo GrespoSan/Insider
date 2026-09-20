@@ -23,6 +23,7 @@ SEC_BULK_URLS = (
 )
 
 TRUE_VALUES = {"1", "true", "t", "yes", "y"}
+MISSING_TICKER_VALUES = {"", "NONE", "N/A", "NA", "NAN", "NULL", "NO TICKER"}
 BAD_SECURITY_WORDS = re.compile(
     r"preferred|warrant|option|unit|note|bond|debenture|right|convertible|debt|phantom|restricted stock unit|rsu",
     re.I,
@@ -201,6 +202,7 @@ def _common_stock_mask(title: pd.Series) -> pd.Series:
 def _clean_ticker(s: pd.Series) -> pd.Series:
     out = s.fillna("").astype(str).str.strip().str.upper()
     out = out.where(out.str.match(r"^[A-Z0-9.\-]{1,12}$"), "")
+    out = out.where(~out.isin(MISSING_TICKER_VALUES), "")
     return out
 
 
@@ -230,7 +232,9 @@ def build_components(
 
     s["FILING_DATE"] = pd.to_datetime(s["FILING_DATE"], errors="coerce")
     s["ISSUERTRADINGSYMBOL"] = _clean_ticker(s["ISSUERTRADINGSYMBOL"])
-    s = s[s["ISSUERTRADINGSYMBOL"].ne("") & s["FILING_DATE"].notna()].copy()
+    # Keep otherwise valid SEC purchases even when the issuer has no public ticker.
+    # They remain useful for SEC statistics but will be marked unpriceable for Yahoo.
+    s = s[s["FILING_DATE"].notna()].copy()
 
     # A transaction row has no reporting-owner foreign key. Joint filings are ambiguous.
     owner_counts = o.groupby("ACCESSION_NUMBER")["RPTOWNERCIK"].nunique(dropna=True)
@@ -372,9 +376,11 @@ def build_issuer_day_signals(
                 .dropna()
                 .astype(str)
                 .str.strip()
+                .str.upper()
             )
-            ticker_values = ticker_values[ticker_values.ne("")]
-            ticker = ticker_values.iloc[0] if not ticker_values.empty else str(issuer)
+            ticker_values = ticker_values[~ticker_values.isin(MISSING_TICKER_VALUES)]
+            ticker = ticker_values.iloc[0] if not ticker_values.empty else ""
+            ticker_status = "ok" if ticker else "missing"
 
             issuer_values = (
                 newly_public["ISSUERNAME"]
@@ -383,17 +389,24 @@ def build_issuer_day_signals(
                 .str.strip()
             )
             issuer_values = issuer_values[issuer_values.ne("")]
-            issuer_name = issuer_values.iloc[0] if not issuer_values.empty else ticker
+            issuer_name = issuer_values.iloc[0] if not issuer_values.empty else (ticker or str(issuer))
+
+            # SEC filings can contain economically implausible values because of issuer input errors,
+            # unit quirks or unusual securities. Preserve the observation but flag it for review;
+            # do not silently delete it or use the flag as a trading score.
+            value_review = bool(total_value >= 1_000_000_000)
 
             results.append({
                 "issuer_cik": str(issuer),
                 "ticker": ticker,
+                "ticker_status": ticker_status,
                 "issuer_name": issuer_name,
                 "signal_date": pd.Timestamp(filing_date).normalize(),
                 "cluster": n_insiders >= int(min_insiders),
                 "n_insiders": n_insiders,
                 "new_filing_value": new_value,
                 "cluster_value": total_value,
+                "value_review": value_review,
                 "window_start": best["TRANS_DATE"].min(),
                 "window_end": best["TRANS_DATE"].max(),
                 "owners": names,
@@ -405,63 +418,117 @@ def build_issuer_day_signals(
 
 
 def yahoo_symbol(ticker: str) -> str:
-    return ticker.replace(".", "-")
+    t = str(ticker or "").strip().upper()
+    if t in MISSING_TICKER_VALUES:
+        return ""
+    return t.replace(".", "-")
+
+
+def _yf_extract_frame(raw: pd.DataFrame, sym: str, single_symbol: bool = False) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        level0 = raw.columns.get_level_values(0)
+        level1 = raw.columns.get_level_values(1)
+        if sym in level0:
+            f = raw[sym].copy()
+        elif sym in level1:
+            f = raw.xs(sym, axis=1, level=1).copy()
+        else:
+            return pd.DataFrame()
+    else:
+        if not single_symbol:
+            return pd.DataFrame()
+        f = raw.copy()
+    if "Open" not in f.columns or "Close" not in f.columns:
+        return pd.DataFrame()
+    f = f[["Open", "Close"]].dropna(how="all")
+    if f.empty:
+        return f
+    idx = pd.to_datetime(f.index)
+    try:
+        idx = idx.tz_localize(None)
+    except TypeError:
+        try:
+            idx = idx.tz_convert(None)
+        except Exception:
+            pass
+    f.index = idx
+    return f
+
+
+def _download_yahoo_prices(symbols: list[str], start: pd.Timestamp, end: pd.Timestamp, *, batch_size: int = 80) -> dict[str, pd.DataFrame]:
+    """Download Yahoo daily prices in conservative batches so 2k+ tickers do not hit one giant request."""
+    import yfinance as yf
+
+    out: dict[str, pd.DataFrame] = {}
+    clean = [s for s in dict.fromkeys(symbols) if s]
+    for pos in range(0, len(clean), batch_size):
+        batch = clean[pos:pos + batch_size]
+        raw = pd.DataFrame()
+        for attempt in range(3):
+            try:
+                raw = yf.download(
+                    batch if len(batch) > 1 else batch[0],
+                    start=start.date().isoformat(),
+                    end=end.date().isoformat(),
+                    auto_adjust=True,
+                    group_by="ticker",
+                    threads=True,
+                    progress=False,
+                    timeout=30,
+                )
+                if raw is not None and not raw.empty:
+                    break
+            except Exception:
+                raw = pd.DataFrame()
+            time.sleep(1.5 * (attempt + 1))
+        for sym in batch:
+            out[sym] = _yf_extract_frame(raw, sym, single_symbol=(len(batch) == 1))
+        # Small pause between batches reduces Yahoo throttling without making the study excessively slow.
+        time.sleep(0.35)
+    return out
 
 
 def backtest_signals(
     signals: pd.DataFrame,
     horizons: tuple[int, ...] = (1, 5, 21, 63),
     benchmark: str = "SPY",
+    batch_size: int = 80,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Free daily-price event study using yfinance.
+    Free daily-price event study using Yahoo Finance.
     Entry: next available trading session OPEN after SEC filing date.
     Exit: CLOSE of horizon-th trading session starting at entry session.
     Excess return: stock return - benchmark return over the same dates.
-    """
-    import yfinance as yf
 
+    Rows with no usable public ticker are preserved with price_status='missing_ticker'.
+    Yahoo is downloaded in batches so a large SEC universe is less fragile.
+    """
     if signals.empty:
         return signals.copy(), pd.DataFrame()
 
     sig = signals.copy()
     sig["signal_date"] = pd.to_datetime(sig["signal_date"])
-    symbols = sorted({yahoo_symbol(x) for x in sig["ticker"].dropna().astype(str) if x})
-    all_symbols = sorted(set(symbols + [benchmark]))
+    sig["yahoo_symbol"] = sig["ticker"].map(yahoo_symbol)
+
+    valid_symbols = sorted({s for s in sig["yahoo_symbol"].astype(str) if s})
     start = sig["signal_date"].min() - pd.Timedelta(days=10)
     end = sig["signal_date"].max() + pd.Timedelta(days=max(horizons) * 2 + 30)
+    prices = _download_yahoo_prices(valid_symbols + [benchmark], start, end, batch_size=batch_size)
+    bench = prices.get(benchmark, pd.DataFrame())
 
-    raw = yf.download(
-        all_symbols,
-        start=start.date().isoformat(),
-        end=end.date().isoformat(),
-        auto_adjust=True,
-        group_by="ticker",
-        threads=True,
-        progress=False,
-    )
-
-    def frame(sym: str) -> pd.DataFrame:
-        if isinstance(raw.columns, pd.MultiIndex):
-            if sym not in raw.columns.get_level_values(0):
-                return pd.DataFrame()
-            f = raw[sym].copy()
-        else:
-            f = raw.copy()
-        if "Open" not in f.columns or "Close" not in f.columns:
-            return pd.DataFrame()
-        f = f[["Open", "Close"]].dropna(how="all")
-        f.index = pd.to_datetime(f.index).tz_localize(None)
-        return f
-
-    bench = frame(benchmark)
     rows: list[dict] = []
     for _, row in sig.iterrows():
-        sym = yahoo_symbol(str(row["ticker"]))
-        px = frame(sym)
+        sym = str(row["yahoo_symbol"] or "")
         base = row.to_dict()
+        if not sym:
+            base["price_status"] = "missing_ticker"
+            rows.append(base)
+            continue
+        px = prices.get(sym, pd.DataFrame())
         if px.empty or bench.empty:
-            base["price_status"] = "missing"
+            base["price_status"] = "missing_price"
             rows.append(base)
             continue
 
@@ -525,7 +592,6 @@ def backtest_signals(
             })
     summary = pd.DataFrame(summary_rows)
     return event, summary
-
 
 def sec_filing_url(accession: str, issuer_cik: str) -> str:
     accession_clean = accession.replace("-", "")

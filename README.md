@@ -1,4 +1,4 @@
-# Independent Insider Radar v0.3
+# Independent Insider Radar v0.4
 
 Prototipo indipendente per verificare l'idea degli acquisti insider senza dati a pagamento.
 
@@ -42,7 +42,7 @@ L'app chiede una email di contatto e invia un User-Agent del tipo:
 
 Non inserire credenziali o password: serve soltanto a identificare correttamente l'accesso automatizzato al sito SEC.
 
-## Definizione cluster v0.3
+## Definizione cluster v0.4
 
 Per ogni nuovo giorno di filing SEC di una società, l'algoritmo guarda soltanto le transazioni che a quel momento risultano già pubbliche. Intorno alle date di transazione appena divulgate cerca acquisti di owner distinti entro `± window_days`. Se gli owner distinti raggiungono `min_insiders`, l'issuer-day è marcato come cluster.
 
@@ -57,7 +57,7 @@ Questa scelta evita il look-ahead più grave: non viene usato un filing futuro p
 - Non fornisce ancora inferenza statistica robusta (clustered standard errors / bootstrap per issuer-tempo).
 - Il dataset trimestrale SEC non copre il trimestre in corso in tempo reale; il live radar richiede un modulo EDGAR giornaliero separato.
 
-## Perché v0.3 è volutamente conservativa
+## Perché v0.4 è volutamente conservativa
 
 L'obiettivo non è costruire subito un “Insider Score”. Prima vogliamo rispondere a domande verificabili:
 
@@ -69,7 +69,14 @@ L'obiettivo non è costruire subito un “Insider Score”. Prima vogliamo rispo
 Solo dopo questi test ha senso aggiungere market cap, fondamentali o scoring.
 
 
-## Correzione v0.3
+## Correzione v0.4
 La SEC usa due percorsi diversi per gli ZIP trimestrali Insider Transactions.
 Il downloader prova automaticamente prima `structureddata` e poi `datastandardsinnovation`,
 così gestisce sia i trimestri storici sia quelli recenti senza modifiche manuali.
+
+
+## Novità v0.4
+- `NONE`/sentinel SEC non è più trattato come ticker Yahoo valido; il record SEC resta conservato.
+- Controvalori cluster >= $1 miliardo vengono marcati `value_review=True` ma non cancellati e non diventano uno score.
+- Download Yahoo in batch con retry per universi di migliaia di ticker.
+- Report separato della copertura prezzi e doppio export: vista corrente / tutti i segnali.

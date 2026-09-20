@@ -15,7 +15,7 @@ from engine import (
 )
 
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.3")
+st.title("Independent Insider Radar — v0.4")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -42,7 +42,7 @@ with st.sidebar:
     min_insiders = st.slider("Insider distinti minimi", 2, 6, 2)
 
 st.info(
-    "Regola v0.3: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
+    "Regola v0.4: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
     "common/ordinary shares, prezzo e quantità positivi. I filing con più reporting owner vengono "
     "scartati perché il dataset piatto SEC non attribuisce ogni riga transazione a uno specifico owner."
 )
@@ -104,7 +104,13 @@ if isinstance(signals, pd.DataFrame) and not signals.empty:
     m1.metric("Componenti P puliti", f"{len(components):,}")
     m2.metric("Issuer-day pubblici", f"{len(signals):,}")
     m3.metric("Cluster", f"{int(signals['cluster'].sum()):,}")
-    m4.metric("Ticker cluster", f"{signals.loc[signals.cluster, 'ticker'].nunique():,}")
+    valid_cluster_tickers = signals.loc[signals.cluster & signals["ticker"].astype(str).str.strip().ne(""), "ticker"].nunique()
+    m4.metric("Ticker cluster prezzabili", f"{valid_cluster_tickers:,}")
+
+    q1, q2 = st.columns(2)
+    q1.metric("Segnali senza ticker SEC", f"{int((signals['ticker_status'] == 'missing').sum()):,}")
+    q2.metric("Valori SEC da rivedere (≥ $1B)", f"{int(signals['value_review'].sum()):,}")
+    st.caption("Le righe senza ticker e i controvalori anomali restano nel dataset SEC: non vengono cancellati. Le prime non entrano nel backtest Yahoo; i secondi sono solo marcati per revisione e non ricevono alcun punteggio.")
 
     show_cluster_only = st.checkbox("Mostra solo cluster", value=True)
     view = signals[signals["cluster"]].copy() if show_cluster_only else signals.copy()
@@ -112,19 +118,28 @@ if isinstance(signals, pd.DataFrame) and not signals.empty:
     view["new_filing_value"] = view["new_filing_value"].round(0)
     st.dataframe(
         view[[
-            "signal_date", "ticker", "issuer_name", "cluster", "n_insiders",
-            "cluster_value", "new_filing_value", "window_start", "window_end",
+            "signal_date", "ticker", "ticker_status", "issuer_name", "cluster", "n_insiders",
+            "cluster_value", "value_review", "new_filing_value", "window_start", "window_end",
             "roles", "owners", "mean_filing_lag_days", "accessions",
         ]],
         use_container_width=True,
         hide_index=True,
     )
-    st.download_button(
-        "Scarica segnali CSV",
-        view.to_csv(index=False).encode("utf-8"),
-        file_name="insider_signals.csv",
-        mime="text/csv",
-    )
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "Scarica vista corrente CSV",
+            view.to_csv(index=False).encode("utf-8"),
+            file_name="insider_signals_view.csv",
+            mime="text/csv",
+        )
+    with d2:
+        st.download_button(
+            "Scarica tutti i segnali CSV",
+            signals.to_csv(index=False).encode("utf-8"),
+            file_name="insider_signals_all.csv",
+            mime="text/csv",
+        )
 
     st.divider()
     st.subheader("Backtest gratuito con Yahoo Finance")
@@ -141,6 +156,13 @@ if isinstance(signals, pd.DataFrame) and not signals.empty:
 summary = st.session_state.get("summary")
 event = st.session_state.get("event")
 if isinstance(summary, pd.DataFrame) and not summary.empty:
+    if isinstance(event, pd.DataFrame) and not event.empty and "price_status" in event.columns:
+        st.subheader("Copertura prezzi Yahoo")
+        status = event["price_status"].value_counts(dropna=False)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Eventi prezzati", f"{int(status.get('ok', 0)):,}")
+        c2.metric("Senza ticker", f"{int(status.get('missing_ticker', 0)):,}")
+        c3.metric("Prezzo Yahoo mancante", f"{int(status.get('missing_price', 0)):,}")
     st.subheader("Sintesi descrittiva")
     pretty = summary.copy()
     for c in ["mean_excess", "median_excess", "win_rate_excess"]:
@@ -152,7 +174,7 @@ if isinstance(summary, pd.DataFrame) and not summary.empty:
     })
     st.dataframe(pretty, use_container_width=True, hide_index=True)
     st.warning(
-        "v0.3 riporta statistiche descrittive, non significatività robusta. "
+        "v0.4 riporta statistiche descrittive, non significatività robusta. "
         "La fase successiva deve aggiungere intervalli di confidenza e confronto cluster-vs-solo "
         "con dipendenza per issuer e periodo."
     )
