@@ -318,8 +318,110 @@ def filtered_first_cluster_bootstrap(
         })
     return pd.DataFrame(rows)
 
+
+
+def _period_summary(df: pd.DataFrame, period_name: str, config_name: str, horizons=(1,5)) -> pd.DataFrame:
+    """Descriptive OOS summary for a frozen configuration in one time period."""
+    rows=[]
+    if df is None or df.empty:
+        return pd.DataFrame()
+    for h in horizons:
+        c=f"excess_{h}"
+        if c not in df.columns:
+            continue
+        x=pd.to_numeric(df[c], errors="coerce").dropna()
+        if x.empty:
+            continue
+        lo,hi=x.quantile(.01),x.quantile(.99)
+        trimmed=x[(x>=lo)&(x<=hi)]
+        rows.append({
+            "config":config_name,
+            "period":period_name,
+            "horizon_sessions":int(h),
+            "n":int(x.size),
+            "n_issuers":int(df.loc[x.index,"issuer_cik"].astype(str).nunique()),
+            "mean_excess":float(x.mean()),
+            "trimmed_mean_excess_1pct":float(trimmed.mean()) if not trimmed.empty else np.nan,
+            "median_excess":float(x.median()),
+            "win_rate_excess":float((x>0).mean()),
+        })
+    return pd.DataFrame(rows)
+
+
+def frozen_oos_config(event: pd.DataFrame, *, config_name: str, min_insiders: int,
+                      value_bucket: str|None=None, episode_gap_days: int=10,
+                      discovery_start: str="2022-01-01", discovery_end: str="2024-12-31",
+                      validation_start: str="2025-01-01", validation_end: str="2026-06-30"):
+    """Apply one pre-declared rule to discovery and validation without retuning it."""
+    labelled=label_cluster_episodes(event, min_insiders=min_insiders, episode_gap_days=episode_gap_days)
+    enriched=enrich_first_cluster_features(labelled)
+    mask=enriched["analysis_group"].eq("FIRST_CLUSTER")
+    if value_bucket is not None:
+        mask &= enriched["value_bucket"].astype(str).eq(value_bucket) & ~enriched["value_review"]
+    selected=enriched[mask].copy()
+    selected["signal_date"]=pd.to_datetime(selected["signal_date"], errors="coerce")
+    disc_start=pd.Timestamp(discovery_start)
+    disc_end=pd.Timestamp(discovery_end)
+    val_start=pd.Timestamp(validation_start)
+    val_end=pd.Timestamp(validation_end)
+    discovery=selected[selected["signal_date"].between(disc_start,disc_end,inclusive="both")].copy()
+    validation=selected[selected["signal_date"].between(val_start,val_end,inclusive="both")].copy()
+    sm=pd.concat([
+        _period_summary(discovery,"EARLY 2022–2024",config_name,(1,5)),
+        _period_summary(validation,"LATE 2025–2026Q2",config_name,(1,5)),
+    ],ignore_index=True)
+    return enriched, selected, discovery, validation, sm
+
+
+def validation_bootstrap_vs_solo(enriched: pd.DataFrame, selected_validation: pd.DataFrame, *,
+                                 validation_start: str="2025-01-01", validation_end: str="2026-06-30", horizons=(1,5),
+                                 n_boot: int=2000, seed: int=42) -> pd.DataFrame:
+    """Issuer bootstrap in the holdout only: frozen selected FIRST_CLUSTER minus contemporaneous SOLO."""
+    d=enriched.copy()
+    d["signal_date"]=pd.to_datetime(d["signal_date"], errors="coerce")
+    val_start=pd.Timestamp(validation_start)
+    val_end=pd.Timestamp(validation_end)
+    val=d[d["signal_date"].between(val_start,val_end,inclusive="both")].copy()
+    selected_idx=set(selected_validation.index.tolist())
+    mask=val.index.to_series().isin(selected_idx)
+    return filtered_first_cluster_bootstrap(val, mask, horizons=horizons, n_boot=n_boot, seed=seed)
+
+
+def build_frozen_oos_tables(event: pd.DataFrame, episode_gap_days: int=10):
+    """Run the three rules frozen before looking at 2025–2026Q2 holdout."""
+    configs=[
+        ("A · FIRST_CLUSTER ≥2 insider",2,None),
+        ("B · FIRST_CLUSTER ≥3 insider",3,None),
+        ("C · ≥3 insider + $100k–250k",3,"$100k–250k"),
+    ]
+    summaries=[]; boots=[]; counts=[]
+    for i,(name,thr,bucket) in enumerate(configs):
+        enriched,selected,discovery,validation,sm=frozen_oos_config(
+            event,config_name=name,min_insiders=thr,value_bucket=bucket,
+            episode_gap_days=episode_gap_days,
+        )
+        if not sm.empty:
+            summaries.append(sm)
+        counts.append({
+            "config":name,
+            "discovery_events":len(discovery),
+            "validation_events":len(validation),
+            "discovery_issuers":discovery["issuer_cik"].astype(str).nunique() if not discovery.empty else 0,
+            "validation_issuers":validation["issuer_cik"].astype(str).nunique() if not validation.empty else 0,
+        })
+        b=validation_bootstrap_vs_solo(enriched,validation,horizons=(1,5),n_boot=2000,seed=42+i)
+        if not b.empty:
+            b.insert(0,"config",name)
+            boots.append(b)
+    return (
+        pd.concat(summaries,ignore_index=True) if summaries else pd.DataFrame(),
+        pd.concat(boots,ignore_index=True) if boots else pd.DataFrame(),
+        pd.DataFrame(counts),
+    )
+
+
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.10")
+st.title("Independent Insider Radar — v0.11")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -779,3 +881,105 @@ if isinstance(event_adv, pd.DataFrame) and not event_adv.empty:
             "Attenzione al data-mining: queste segmentazioni sono esplorative. Un filtro che sembra migliore sullo stesso campione 2022–2026 "
             "deve essere validato fuori campione o con walk-forward prima di essere considerato un edge."
         )
+
+        st.divider()
+        st.header("Stabilità temporale / pseudo-OOS — v0.11")
+        st.caption(
+            "Split temporale: 2022–2024 vs 2025–2026 Q2, solo 1 e 5 sedute. "
+            "Serve a misurare la stabilità nel tempo delle tre configurazioni già emerse."
+        )
+        st.info(
+            "Configurazioni congelate per questo split: A) FIRST_CLUSTER ≥2 insider; "
+            "B) FIRST_CLUSTER ≥3 insider; C) FIRST_CLUSTER ≥3 insider con controvalore $100k–250k."
+        )
+        st.warning(
+            "Nota metodologica importante: questo NON è un holdout completamente incontaminato, perché le configurazioni — soprattutto la fascia $100k–250k — "
+            "sono emerse dopo aver già osservato il campione 2022–2026. Va quindi letto come test di stabilità temporale, non come conferma definitiva dell'edge. "
+            "La conferma realmente indipendente richiederà un periodo mai usato per scegliere le regole (es. 2006–2021 come replica storica separata, oppure dati futuri post-2026Q2)."
+        )
+        with st.spinner("Validazione temporale + bootstrap issuer sul holdout..."):
+            oos_summary,oos_boot,oos_counts=build_frozen_oos_tables(event_adv,episode_gap_days=int(episode_gap))
+
+        if not oos_counts.empty:
+            st.subheader("Dimensione campioni congelati")
+            st.dataframe(oos_counts,use_container_width=True,hide_index=True)
+
+        if not oos_summary.empty:
+            st.subheader("Periodo iniziale vs periodo recente")
+            op=oos_summary.copy()
+            for c in ["mean_excess","trimmed_mean_excess_1pct","median_excess","win_rate_excess"]:
+                op[c]=(op[c]*100).round(2)
+            op=op.rename(columns={
+                "mean_excess":"mean_excess_%",
+                "trimmed_mean_excess_1pct":"trimmed_mean_1pct_%",
+                "median_excess":"median_excess_%",
+                "win_rate_excess":"win_rate_excess_%",
+            })
+            st.dataframe(op,use_container_width=True,hide_index=True)
+
+            # compact persistence view, descriptive only
+            piv=oos_summary.pivot_table(
+                index=["config","horizon_sessions"],columns="period",values=["trimmed_mean_excess_1pct","median_excess","win_rate_excess"],aggfunc="first"
+            )
+            persist=[]
+            for (cfg,h),row in piv.iterrows():
+                try:
+                    dtrim=float(row[("trimmed_mean_excess_1pct","EARLY 2022–2024")])
+                    vtrim=float(row[("trimmed_mean_excess_1pct","LATE 2025–2026Q2")])
+                    dmed=float(row[("median_excess","EARLY 2022–2024")])
+                    vmed=float(row[("median_excess","LATE 2025–2026Q2")])
+                    vwin=float(row[("win_rate_excess","LATE 2025–2026Q2")])
+                except Exception:
+                    continue
+                persist.append({
+                    "config":cfg,"horizon_sessions":int(h),
+                    "discovery_trimmed_%":round(dtrim*100,2),
+                    "validation_trimmed_%":round(vtrim*100,2),
+                    "discovery_median_%":round(dmed*100,2),
+                    "validation_median_%":round(vmed*100,2),
+                    "validation_win_rate_%":round(vwin*100,2),
+                    "segno_trimmed_preservato":bool((dtrim>0)==(vtrim>0)),
+                })
+            if persist:
+                st.subheader("Persistenza descrittiva nel periodo recente")
+                st.dataframe(pd.DataFrame(persist),use_container_width=True,hide_index=True)
+
+        if not oos_boot.empty:
+            st.subheader("Periodo recente 2025–2026 Q2: bootstrap issuer vs SOLO")
+            bp=oos_boot.copy()
+            for c in ["observed_diff","ci95_low","ci95_high"]:
+                bp[c]=(bp[c]*100).round(2)
+            bp=bp.rename(columns={
+                "observed_diff":"diff_media_%",
+                "ci95_low":"CI95_low_%",
+                "ci95_high":"CI95_high_%",
+                "robustly_above_zero":"CI_interamente_>0",
+            })
+            keep=[c for c in ["config","horizon_sessions","diff_media_%","CI95_low_%","CI95_high_%","bootstrap_reps","n_selected","n_selected_issuers","CI_interamente_>0"] if c in bp.columns]
+            st.dataframe(bp[keep],use_container_width=True,hide_index=True)
+            robust=oos_boot[oos_boot["robustly_above_zero"]]
+            if robust.empty:
+                st.warning(
+                    "Nel periodo recente nessuna delle tre regole ha un CI95% issuer-level interamente sopra zero a 1 o 5 sedute. "
+                    "Questo non annulla il pattern descrittivo, ma non consente di definirlo un edge robusto."
+                )
+            else:
+                st.success(
+                    "Nel periodo recente esistono configurazioni con CI95% issuer-level interamente sopra zero. "
+                    "È un risultato interessante, ma resta esplorativo perché il periodo 2025–2026 era già stato osservato quando abbiamo scelto le configurazioni."
+                )
+
+        if not oos_summary.empty:
+            export=oos_summary.copy()
+            st.download_button(
+                "Scarica validazione OOS CSV",
+                export.to_csv(index=False).encode("utf-8"),
+                file_name="insider_oos_validation_v0_11.csv",
+                mime="text/csv",
+            )
+
+        st.caption(
+            "Regola metodologica v0.11: da questo punto le tre configurazioni vengono congelate. Non aggiungiamo soglie o ruoli per migliorare il 2025–2026Q2. "
+            "La prossima conferma dovrà arrivare da dati separati che non useremo per scegliere ulteriori filtri."
+        )
+
