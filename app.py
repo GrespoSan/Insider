@@ -13,10 +13,13 @@ from engine import (
     latest_completed_quarter,
     quarter_range,
     normalize_loaded_signals,
+    normalize_loaded_event_study,
+    advanced_group_summary,
+    issuer_cluster_bootstrap_difference,
 )
 
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.8")
+st.title("Independent Insider Radar — v0.9")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -70,8 +73,25 @@ with st.sidebar:
             except Exception as exc:
                 st.error(f"CSV non valido: {exc}")
 
+    uploaded_event = st.file_uploader(
+        "Carica insider_event_study.csv (opzionale)",
+        type=["csv"],
+        help="Consente di saltare anche Yahoo e passare direttamente all'analisi FIRST_CLUSTER.",
+        key="event_csv_uploader",
+    )
+    if uploaded_event is not None:
+        if st.button("Usa Event Study caricato", use_container_width=True):
+            try:
+                ev = pd.read_csv(uploaded_event, low_memory=False)
+                ev = normalize_loaded_event_study(ev)
+                st.session_state["event"] = ev
+                st.session_state["summary"] = pd.DataFrame()
+                st.success(f"Eventi backtest caricati: {len(ev):,}. Puoi analizzare subito FIRST_CLUSTER.")
+            except Exception as exc:
+                st.error(f"Event Study CSV non valido: {exc}")
+
 st.info(
-    "Regola v0.8: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
+    "Regola v0.9: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
     "common/ordinary shares, prezzo e quantità positivi. I filing con più reporting owner vengono "
     "scartati perché il dataset piatto SEC non attribuisce ogni riga transazione a uno specifico owner."
 )
@@ -224,10 +244,9 @@ if isinstance(summary, pd.DataFrame) and not summary.empty:
         "p99_excess": "p99_%",
     })
     st.dataframe(pretty, use_container_width=True, hide_index=True)
-    st.warning(
-        "v0.8 usa backtest Yahoo a memoria costante, mantiene la guardia anti-ticker riutilizzato/storico Yahoo incompleto e consente di riprendere il lavoro da insider_signals_all.csv. "
-        "Le statistiche restano descrittive: la fase successiva deve aggiungere intervalli di confidenza e confronto cluster-vs-solo "
-        "con dipendenza per issuer e periodo, oltre a separare il primo trigger di cluster dalle ripetizioni ravvicinate."
+    st.info(
+        "v0.9 aggiunge FIRST_CLUSTER vs REPEAT_CLUSTER e bootstrap a livello issuer. "
+        "La finestra di episodio sotto non cambia la finestra transazioni SEC originaria: decide solo quando due trigger cluster appartengono allo stesso episodio."
     )
     if isinstance(event, pd.DataFrame):
         st.download_button(
@@ -235,4 +254,104 @@ if isinstance(summary, pd.DataFrame) and not summary.empty:
             event.to_csv(index=False).encode("utf-8"),
             file_name="insider_event_study.csv",
             mime="text/csv",
+        )
+
+
+# --- Analisi avanzata v0.9: può partire anche da insider_event_study.csv caricato ---
+event_adv = st.session_state.get("event")
+if isinstance(event_adv, pd.DataFrame) and not event_adv.empty:
+    st.divider()
+    st.header("Analisi FIRST CLUSTER — v0.9")
+    a1, a2 = st.columns(2)
+    with a1:
+        adv_min_insiders = st.selectbox("Soglia insider per cluster", [2, 3, 4], index=0, key="adv_min_insiders")
+    with a2:
+        episode_gap = st.selectbox("Nuovo episodio dopo (giorni)", [3, 5, 10, 20], index=2, key="episode_gap")
+    st.caption(
+        "Importante: la soglia insider può essere ricalcolata dal CSV perché n_insiders è disponibile. "
+        "Il parametro giorni qui separa episodi successivi dello stesso issuer; NON sostituisce la finestra transazioni ±10 giorni usata per costruire i segnali originali."
+    )
+    labelled, adv_summary = advanced_group_summary(
+        event_adv, min_insiders=int(adv_min_insiders), episode_gap_days=int(episode_gap)
+    )
+    if not adv_summary.empty:
+        pretty_adv = adv_summary.copy()
+        for c in ["mean_excess", "trimmed_mean_excess_1pct", "median_excess", "win_rate_excess", "p01_excess", "p99_excess"]:
+            pretty_adv[c] = (pretty_adv[c] * 100).round(2)
+        pretty_adv = pretty_adv.rename(columns={
+            "mean_excess":"mean_excess_%",
+            "trimmed_mean_excess_1pct":"trimmed_mean_1pct_%",
+            "median_excess":"median_excess_%",
+            "win_rate_excess":"win_rate_excess_%",
+            "p01_excess":"p01_%",
+            "p99_excess":"p99_%",
+        })
+        st.subheader("SOLO vs FIRST_CLUSTER vs REPEAT_CLUSTER")
+        st.dataframe(pretty_adv, use_container_width=True, hide_index=True)
+
+        first_count = int((labelled["analysis_group"] == "FIRST_CLUSTER").sum())
+        repeat_count = int((labelled["analysis_group"] == "REPEAT_CLUSTER").sum())
+        solo_count = int((labelled["analysis_group"] == "SOLO").sum())
+        x1, x2, x3 = st.columns(3)
+        x1.metric("SOLO", f"{solo_count:,}")
+        x2.metric("FIRST_CLUSTER", f"{first_count:,}")
+        x3.metric("REPEAT_CLUSTER", f"{repeat_count:,}")
+
+        st.subheader("Bootstrap issuer: FIRST_CLUSTER − SOLO")
+        with st.spinner("Bootstrap per issuer (2.000 repliche)..."):
+            boot = issuer_cluster_bootstrap_difference(
+                event_adv,
+                min_insiders=int(adv_min_insiders),
+                episode_gap_days=int(episode_gap),
+                n_boot=2000,
+                seed=42,
+            )
+        if not boot.empty:
+            boot_pretty = boot.copy()
+            for c in ["observed_diff", "ci95_low", "ci95_high"]:
+                boot_pretty[c] = (boot_pretty[c] * 100).round(2)
+            boot_pretty = boot_pretty.rename(columns={
+                "observed_diff":"diff_media_%",
+                "ci95_low":"CI95_low_%",
+                "ci95_high":"CI95_high_%",
+                "robustly_above_zero":"CI_interamente_>0",
+            })
+            st.dataframe(boot_pretty, use_container_width=True, hide_index=True)
+            robust = boot[boot["robustly_above_zero"]]
+            if robust.empty:
+                st.warning("Con questa configurazione nessun orizzonte ha un CI95% interamente sopra zero: il vantaggio FIRST_CLUSTER non è ancora robustamente distinto da SOLO.")
+            else:
+                hs = ", ".join(str(int(x)) for x in robust["horizon_sessions"].tolist())
+                st.success(f"CI95% interamente sopra zero agli orizzonti: {hs} sedute.")
+
+        st.download_button(
+            "Scarica Event Study con etichette episodio",
+            labelled.to_csv(index=False).encode("utf-8"),
+            file_name="insider_event_study_first_cluster.csv",
+            mime="text/csv",
+        )
+
+        st.subheader("Sensibilità soglia insider (stessa finestra SEC originaria)")
+        sens_rows = []
+        for thr in [2, 3, 4]:
+            _, sm = advanced_group_summary(event_adv, min_insiders=thr, episode_gap_days=int(episode_gap))
+            if sm.empty:
+                continue
+            fc = sm[sm["group"].eq("FIRST_CLUSTER")].copy()
+            for _, r in fc.iterrows():
+                sens_rows.append({
+                    "min_insiders": thr,
+                    "horizon_sessions": int(r["horizon_sessions"]),
+                    "n": int(r["n"]),
+                    "mean_excess_%": round(float(r["mean_excess"])*100,2),
+                    "trimmed_mean_1pct_%": round(float(r["trimmed_mean_excess_1pct"])*100,2),
+                    "median_excess_%": round(float(r["median_excess"])*100,2),
+                    "win_rate_excess_%": round(float(r["win_rate_excess"])*100,2),
+                })
+        if sens_rows:
+            st.dataframe(pd.DataFrame(sens_rows), use_container_width=True, hide_index=True)
+
+        st.caption(
+            "Per testare davvero finestre transazioni SEC diverse (±3/±5/±10/±20 giorni) serve ricostruire i segnali dai componenti Form 4, "
+            "perché il CSV event study conserva il risultato della finestra usata in origine ma non tutte le singole transazioni necessarie a ricalcolarla."
         )

@@ -167,3 +167,50 @@ def test_normalize_loaded_signals_rejects_view_missing_core_column():
     raw = pd.DataFrame({"signal_date": ["2026-01-01"], "ticker": ["AAPL"], "cluster": [True]})
     with pytest.raises(ValueError):
         normalize_loaded_signals(raw)
+
+
+def test_label_cluster_episodes_first_and_repeat():
+    import pandas as pd
+    from engine import label_cluster_episodes
+    df = pd.DataFrame([
+        {"issuer_cik":"1","signal_date":"2026-01-01","n_insiders":1,"cluster":False},
+        {"issuer_cik":"1","signal_date":"2026-01-05","n_insiders":2,"cluster":True},
+        {"issuer_cik":"1","signal_date":"2026-01-08","n_insiders":3,"cluster":True},
+        {"issuer_cik":"1","signal_date":"2026-01-25","n_insiders":2,"cluster":True},
+    ])
+    out = label_cluster_episodes(df, min_insiders=2, episode_gap_days=10)
+    assert out.analysis_group.tolist() == ["SOLO","FIRST_CLUSTER","REPEAT_CLUSTER","FIRST_CLUSTER"]
+
+
+def test_threshold_reclassifies_two_insider_as_solo():
+    import pandas as pd
+    from engine import label_cluster_episodes
+    df = pd.DataFrame([
+        {"issuer_cik":"1","signal_date":"2026-01-05","n_insiders":2,"cluster":True},
+        {"issuer_cik":"1","signal_date":"2026-01-08","n_insiders":3,"cluster":True},
+    ])
+    out = label_cluster_episodes(df, min_insiders=3, episode_gap_days=10)
+    assert out.analysis_group.tolist() == ["SOLO","FIRST_CLUSTER"]
+
+
+def test_bootstrap_difference_runs_and_returns_ci():
+    import pandas as pd
+    from engine import issuer_cluster_bootstrap_difference
+    rows=[]
+    for issuer in range(1,20):
+        rows.append({"issuer_cik":str(issuer),"signal_date":pd.Timestamp("2026-01-01"),"n_insiders":1,"cluster":False,"excess_1":0.00})
+        rows.append({"issuer_cik":str(issuer),"signal_date":pd.Timestamp("2026-01-20"),"n_insiders":2,"cluster":True,"excess_1":0.02})
+    df=pd.DataFrame(rows)
+    out=issuer_cluster_bootstrap_difference(df,horizons=(1,),n_boot=200,seed=1)
+    assert len(out)==1
+    assert out.iloc[0].observed_diff > 0
+    assert "ci95_low" in out.columns
+
+
+def test_normalize_loaded_event_study():
+    import pandas as pd
+    from engine import normalize_loaded_event_study
+    raw=pd.DataFrame({"issuer_cik":[1],"signal_date":["2026-01-01"],"cluster":["True"],"n_insiders":[2],"excess_1":[0.01]})
+    out=normalize_loaded_event_study(raw)
+    assert bool(out.iloc[0].cluster) is True
+    assert int(out.iloc[0].n_insiders)==2

@@ -778,3 +778,182 @@ def sec_filing_url(accession: str, issuer_cik: str) -> str:
     accession_clean = accession.replace("-", "")
     cik = str(issuer_cik).lstrip("0")
     return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_clean}/"
+
+
+
+def normalize_loaded_event_study(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate a previously exported insider_event_study.csv for advanced analysis."""
+    if df is None or df.empty:
+        raise ValueError("Il CSV event study è vuoto.")
+    out = df.copy()
+    required = {"issuer_cik", "signal_date", "cluster"}
+    missing = sorted(required.difference(out.columns))
+    if missing:
+        raise ValueError("CSV event study non compatibile. Colonne mancanti: " + ", ".join(missing))
+    out["signal_date"] = pd.to_datetime(out["signal_date"], errors="coerce")
+    if out["signal_date"].isna().all():
+        raise ValueError("signal_date non contiene date valide.")
+    def _to_bool(v):
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        if pd.isna(v):
+            return False
+        t = str(v).strip().lower()
+        return t in {"true", "1", "yes", "y", "si", "sì"}
+    out["cluster"] = out["cluster"].map(_to_bool)
+    out["issuer_cik"] = out["issuer_cik"].fillna("").astype(str).str.replace(r"\.0$", "", regex=True)
+    if "n_insiders" in out.columns:
+        out["n_insiders"] = pd.to_numeric(out["n_insiders"], errors="coerce").fillna(1).astype(int)
+    else:
+        out["n_insiders"] = np.where(out["cluster"], 2, 1)
+    return out
+
+
+def label_cluster_episodes(
+    df: pd.DataFrame,
+    *,
+    min_insiders: int = 2,
+    episode_gap_days: int = 10,
+) -> pd.DataFrame:
+    """Label rows as SOLO, FIRST_CLUSTER or REPEAT_CLUSTER.
+
+    The cluster threshold is applied to n_insiders already computed using the signal file's
+    original transaction window. `episode_gap_days` only defines when a later cluster signal
+    is considered a new episode; it does NOT change the original transaction-window width.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    out = df.copy()
+    out["signal_date"] = pd.to_datetime(out["signal_date"], errors="coerce")
+    out["issuer_cik"] = out["issuer_cik"].fillna("").astype(str)
+    n = pd.to_numeric(out.get("n_insiders", 1), errors="coerce").fillna(1).astype(int)
+    qualifies = n >= int(min_insiders)
+    out["analysis_group"] = "SOLO"
+    out["cluster_episode_id"] = pd.NA
+
+    for issuer, idx in out[qualifies].groupby("issuer_cik", sort=False).groups.items():
+        ordered = out.loc[list(idx)].sort_values("signal_date")
+        episode = 0
+        prev_date = None
+        for ridx, row in ordered.iterrows():
+            d = pd.Timestamp(row["signal_date"])
+            is_first = prev_date is None or (d.normalize() - prev_date.normalize()).days > int(episode_gap_days)
+            if is_first:
+                episode += 1
+                out.at[ridx, "analysis_group"] = "FIRST_CLUSTER"
+            else:
+                out.at[ridx, "analysis_group"] = "REPEAT_CLUSTER"
+            out.at[ridx, "cluster_episode_id"] = f"{issuer}:{episode}"
+            prev_date = d
+    return out
+
+
+def advanced_group_summary(
+    event: pd.DataFrame,
+    horizons: tuple[int, ...] = (1, 5, 21, 63),
+    *,
+    min_insiders: int = 2,
+    episode_gap_days: int = 10,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return episode-labelled event data and descriptive summary for 3 groups."""
+    labelled = label_cluster_episodes(event, min_insiders=min_insiders, episode_gap_days=episode_gap_days)
+    rows = []
+    group_order = ["SOLO", "FIRST_CLUSTER", "REPEAT_CLUSTER"]
+    for group in group_order:
+        sub = labelled[labelled["analysis_group"].eq(group)]
+        for h in horizons:
+            c = f"excess_{h}"
+            if c not in sub.columns:
+                continue
+            x = pd.to_numeric(sub[c], errors="coerce").dropna()
+            if x.empty:
+                continue
+            lo, hi = x.quantile(0.01), x.quantile(0.99)
+            trimmed = x[(x >= lo) & (x <= hi)]
+            rows.append({
+                "group": group,
+                "horizon_sessions": h,
+                "n": int(x.size),
+                "n_issuers": int(sub.loc[x.index, "issuer_cik"].astype(str).nunique()),
+                "mean_excess": float(x.mean()),
+                "trimmed_mean_excess_1pct": float(trimmed.mean()) if not trimmed.empty else np.nan,
+                "median_excess": float(x.median()),
+                "win_rate_excess": float((x > 0).mean()),
+                "p01_excess": float(lo),
+                "p99_excess": float(hi),
+            })
+    return labelled, pd.DataFrame(rows)
+
+
+def issuer_cluster_bootstrap_difference(
+    event: pd.DataFrame,
+    *,
+    group_a: str = "FIRST_CLUSTER",
+    group_b: str = "SOLO",
+    horizons: tuple[int, ...] = (1, 5, 21, 63),
+    min_insiders: int = 2,
+    episode_gap_days: int = 10,
+    n_boot: int = 2000,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Issuer-cluster bootstrap for mean excess difference group_a - group_b.
+
+    Resamples issuer clusters with replacement and aggregates all observations belonging to
+    sampled issuers, preserving within-issuer dependence. This is intentionally a robust
+    comparison, not a trading recommendation.
+    """
+    labelled = label_cluster_episodes(event, min_insiders=min_insiders, episode_gap_days=episode_gap_days)
+    rng = np.random.default_rng(seed)
+    issuer_ids = labelled["issuer_cik"].dropna().astype(str).unique()
+    if len(issuer_ids) == 0:
+        return pd.DataFrame()
+    rows = []
+    for h in horizons:
+        col = f"excess_{h}"
+        if col not in labelled.columns:
+            continue
+        d = labelled[["issuer_cik", "analysis_group", col]].copy()
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=[col])
+        if d.empty:
+            continue
+        agg = d.groupby(["issuer_cik", "analysis_group"])[col].agg(["sum", "count"]).reset_index()
+        issuer_pos = {u:i for i,u in enumerate(issuer_ids)}
+        sums_a = np.zeros(len(issuer_ids)); counts_a = np.zeros(len(issuer_ids))
+        sums_b = np.zeros(len(issuer_ids)); counts_b = np.zeros(len(issuer_ids))
+        for _, r in agg.iterrows():
+            i = issuer_pos.get(str(r["issuer_cik"]))
+            if i is None:
+                continue
+            if r["analysis_group"] == group_a:
+                sums_a[i] += float(r["sum"]); counts_a[i] += float(r["count"])
+            elif r["analysis_group"] == group_b:
+                sums_b[i] += float(r["sum"]); counts_b[i] += float(r["count"])
+        obs_a = d.loc[d.analysis_group.eq(group_a), col]
+        obs_b = d.loc[d.analysis_group.eq(group_b), col]
+        if obs_a.empty or obs_b.empty:
+            continue
+        observed = float(obs_a.mean() - obs_b.mean())
+        boots = []
+        for _ in range(int(n_boot)):
+            sample = rng.integers(0, len(issuer_ids), size=len(issuer_ids))
+            ca = counts_a[sample].sum(); cb = counts_b[sample].sum()
+            if ca <= 0 or cb <= 0:
+                continue
+            ma = sums_a[sample].sum() / ca
+            mb = sums_b[sample].sum() / cb
+            boots.append(ma - mb)
+        if not boots:
+            continue
+        b = np.asarray(boots, dtype=float)
+        rows.append({
+            "comparison": f"{group_a} - {group_b}",
+            "horizon_sessions": h,
+            "observed_diff": observed,
+            "ci95_low": float(np.quantile(b, 0.025)),
+            "ci95_high": float(np.quantile(b, 0.975)),
+            "bootstrap_reps": int(len(b)),
+            "n_issuers": int(len(issuer_ids)),
+            "robustly_above_zero": bool(np.quantile(b, 0.025) > 0),
+        })
+    return pd.DataFrame(rows)
