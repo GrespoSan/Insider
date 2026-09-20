@@ -495,12 +495,18 @@ def backtest_signals(
     horizons: tuple[int, ...] = (1, 5, 21, 63),
     benchmark: str = "SPY",
     batch_size: int = 80,
+    max_entry_lag_days: int = 7,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Free daily-price event study using Yahoo Finance.
     Entry: next available trading session OPEN after SEC filing date.
     Exit: CLOSE of horizon-th trading session starting at entry session.
     Excess return: stock return - benchmark return over the same dates.
+
+    Critical guard: the first available Yahoo session must be within max_entry_lag_days
+    calendar days after the SEC filing date. If it is later, the row is marked
+    stale_symbol_or_gap and excluded from returns. This prevents delisted/reused tickers
+    or incomplete Yahoo histories from turning a 2023 signal into a 2026 entry.
 
     Rows with no usable public ticker are preserved with price_status='missing_ticker'.
     Yahoo is downloaded in batches so a large SEC universe is less fragile.
@@ -522,6 +528,10 @@ def backtest_signals(
     for _, row in sig.iterrows():
         sym = str(row["yahoo_symbol"] or "")
         base = row.to_dict()
+        for h in horizons:
+            base[f"ret_{h}"] = np.nan
+            base[f"spy_{h}"] = np.nan
+            base[f"excess_{h}"] = np.nan
         if not sym:
             base["price_status"] = "missing_ticker"
             rows.append(base)
@@ -538,6 +548,13 @@ def backtest_signals(
             rows.append(base)
             continue
         entry_date = entry_candidates[0]
+        entry_lag_days = int((pd.Timestamp(entry_date) - pd.Timestamp(row["signal_date"])).days)
+        base["entry_lag_days"] = entry_lag_days
+        if entry_lag_days > int(max_entry_lag_days):
+            base["entry_date"] = entry_date
+            base["price_status"] = "stale_symbol_or_gap"
+            rows.append(base)
+            continue
         if entry_date not in bench.index:
             base["price_status"] = "benchmark_missing_entry"
             rows.append(base)
@@ -582,13 +599,21 @@ def backtest_signals(
             x = pd.to_numeric(subgroup[f"excess_{h}"], errors="coerce").dropna()
             if x.empty:
                 continue
+            lo = x.quantile(0.01)
+            hi = x.quantile(0.99)
+            trimmed = x[(x >= lo) & (x <= hi)]
+            issuer_count = int(subgroup.loc[x.index, "issuer_cik"].astype(str).nunique())
             summary_rows.append({
                 "group": "CLUSTER" if bool(cluster_value) else "SOLO",
                 "horizon_sessions": h,
                 "n": int(x.size),
+                "n_issuers": issuer_count,
                 "mean_excess": float(x.mean()),
+                "trimmed_mean_excess_1pct": float(trimmed.mean()) if not trimmed.empty else np.nan,
                 "median_excess": float(x.median()),
                 "win_rate_excess": float((x > 0).mean()),
+                "p01_excess": float(x.quantile(0.01)),
+                "p99_excess": float(x.quantile(0.99)),
             })
     summary = pd.DataFrame(summary_rows)
     return event, summary

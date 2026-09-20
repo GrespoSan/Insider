@@ -67,3 +67,48 @@ def test_value_review_flag_only_marks_extreme_values():
     ]
     sig = build_issuer_day_signals(pd.DataFrame(rows), window_days=10, min_insiders=2)
     assert bool(sig.iloc[0].value_review) is True
+
+
+def test_backtest_rejects_stale_symbol_history(monkeypatch=None):
+    import engine
+    sig = pd.DataFrame([{
+        'issuer_cik':'1','ticker':'TST','ticker_status':'ok','issuer_name':'Test',
+        'signal_date':pd.Timestamp('2023-03-14'),'cluster':False,'n_insiders':1,
+        'new_filing_value':10000,'cluster_value':10000,'value_review':False,
+        'window_start':pd.Timestamp('2023-03-10'),'window_end':pd.Timestamp('2023-03-10'),
+        'owners':'Alice','roles':'CEO','mean_filing_lag_days':2.0,'accessions':'A1'
+    }])
+    idx = pd.to_datetime(['2026-07-20','2026-07-21'])
+    px = pd.DataFrame({'Open':[1.0,2.0],'Close':[2.0,2.5]}, index=idx)
+    spy = pd.DataFrame({'Open':[100.0,101.0],'Close':[101.0,102.0]}, index=idx)
+    original = engine._download_yahoo_prices
+    try:
+        engine._download_yahoo_prices = lambda symbols, start, end, batch_size=80: {'TST':px, 'SPY':spy}
+        event, summary = engine.backtest_signals(sig, max_entry_lag_days=7)
+    finally:
+        engine._download_yahoo_prices = original
+    assert event.iloc[0].price_status == 'stale_symbol_or_gap'
+    assert pd.isna(event.iloc[0].get('excess_1', float('nan')))
+
+
+def test_backtest_accepts_next_session_within_guard(monkeypatch=None):
+    import engine
+    sig = pd.DataFrame([{
+        'issuer_cik':'1','ticker':'TST','ticker_status':'ok','issuer_name':'Test',
+        'signal_date':pd.Timestamp('2026-01-02'),'cluster':False,'n_insiders':1,
+        'new_filing_value':10000,'cluster_value':10000,'value_review':False,
+        'window_start':pd.Timestamp('2026-01-02'),'window_end':pd.Timestamp('2026-01-02'),
+        'owners':'Alice','roles':'CEO','mean_filing_lag_days':0.0,'accessions':'A1'
+    }])
+    idx = pd.to_datetime(['2026-01-05','2026-01-06','2026-01-07','2026-01-08','2026-01-09'])
+    px = pd.DataFrame({'Open':[10,10,10,10,10],'Close':[11,12,13,14,15]}, index=idx)
+    spy = pd.DataFrame({'Open':[100,100,100,100,100],'Close':[101,102,103,104,105]}, index=idx)
+    original = engine._download_yahoo_prices
+    try:
+        engine._download_yahoo_prices = lambda symbols, start, end, batch_size=80: {'TST':px, 'SPY':spy}
+        event, summary = engine.backtest_signals(sig, horizons=(1,5), max_entry_lag_days=7)
+    finally:
+        engine._download_yahoo_prices = original
+    assert event.iloc[0].price_status == 'ok'
+    assert int(event.iloc[0].entry_lag_days) == 3
+    assert abs(event.iloc[0].excess_1 - 0.09) < 1e-12

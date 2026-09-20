@@ -15,7 +15,7 @@ from engine import (
 )
 
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.4")
+st.title("Independent Insider Radar — v0.5")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -42,7 +42,7 @@ with st.sidebar:
     min_insiders = st.slider("Insider distinti minimi", 2, 6, 2)
 
 st.info(
-    "Regola v0.4: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
+    "Regola v0.5: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
     "common/ordinary shares, prezzo e quantità positivi. I filing con più reporting owner vengono "
     "scartati perché il dataset piatto SEC non attribuisce ogni riga transazione a uno specifico owner."
 )
@@ -147,9 +147,10 @@ if isinstance(signals, pd.DataFrame) and not signals.empty:
         "Ingresso conservativo: OPEN della prima seduta successiva alla filing date SEC. "
         "Excess return = rendimento titolo - SPY sullo stesso intervallo."
     )
+    st.caption("Guardia anti-ticker riutilizzato/storico incompleto: l'entry Yahoo deve cadere entro 7 giorni di calendario dal filing SEC.")
     if st.button("3. Esegui event study 1/5/21/63 sedute"):
         with st.spinner("Download prezzi e calcolo..."):
-            event, summary = backtest_signals(signals)
+            event, summary = backtest_signals(signals, max_entry_lag_days=7)
             st.session_state["event"] = event
             st.session_state["summary"] = summary
 
@@ -159,24 +160,29 @@ if isinstance(summary, pd.DataFrame) and not summary.empty:
     if isinstance(event, pd.DataFrame) and not event.empty and "price_status" in event.columns:
         st.subheader("Copertura prezzi Yahoo")
         status = event["price_status"].value_counts(dropna=False)
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Eventi prezzati", f"{int(status.get('ok', 0)):,}")
         c2.metric("Senza ticker", f"{int(status.get('missing_ticker', 0)):,}")
         c3.metric("Prezzo Yahoo mancante", f"{int(status.get('missing_price', 0)):,}")
+        c4.metric("Ticker/storico incoerente", f"{int(status.get('stale_symbol_or_gap', 0)):,}")
     st.subheader("Sintesi descrittiva")
     pretty = summary.copy()
-    for c in ["mean_excess", "median_excess", "win_rate_excess"]:
-        pretty[c] = (pretty[c] * 100).round(2)
+    for c in ["mean_excess", "trimmed_mean_excess_1pct", "median_excess", "win_rate_excess", "p01_excess", "p99_excess"]:
+        if c in pretty.columns:
+            pretty[c] = (pretty[c] * 100).round(2)
     pretty = pretty.rename(columns={
         "mean_excess": "mean_excess_%",
+        "trimmed_mean_excess_1pct": "trimmed_mean_1pct_%",
         "median_excess": "median_excess_%",
         "win_rate_excess": "win_rate_excess_%",
+        "p01_excess": "p01_%",
+        "p99_excess": "p99_%",
     })
     st.dataframe(pretty, use_container_width=True, hide_index=True)
     st.warning(
-        "v0.4 riporta statistiche descrittive, non significatività robusta. "
-        "La fase successiva deve aggiungere intervalli di confidenza e confronto cluster-vs-solo "
-        "con dipendenza per issuer e periodo."
+        "v0.5 corregge il bias da ticker riutilizzati/storici Yahoo incompleti e mostra anche una media tagliata 1%. "
+        "Le statistiche restano descrittive: la fase successiva deve aggiungere intervalli di confidenza e confronto cluster-vs-solo "
+        "con dipendenza per issuer e periodo, oltre a separare il primo trigger di cluster dalle ripetizioni ravvicinate."
     )
     if isinstance(event, pd.DataFrame):
         st.download_button(

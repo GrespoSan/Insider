@@ -1,82 +1,21 @@
-# Independent Insider Radar v0.4
+# Independent Insider Radar v0.5
 
-Prototipo indipendente per verificare l'idea degli acquisti insider senza dati a pagamento.
+Prototipo indipendente basato su SEC Form 4 e prezzi Yahoo Finance.
 
-## Cosa fa
+## Correzione critica rispetto a v0.4
+La v0.4 sceglieva la prima data Yahoo successiva al filing SEC senza imporre una distanza massima. Per ticker delistati, riutilizzati o con storico Yahoo incompleto, un segnale del 2023 poteva essere associato alla prima quotazione disponibile del 2026, creando rendimenti artificiali enormi.
 
-1. Scarica i dataset trimestrali ufficiali SEC Forms 3/4/5.
-2. Tiene solo Form 4 originali (non 4/A).
-3. Tiene solo transazioni non derivate con:
-   - `TRANS_CODE = P`
-   - `TRANS_ACQUIRED_DISP_CD = A`
-   - common/ordinary shares
-   - quantità e prezzo positivi.
-4. Per prudenza elimina i filing con più reporting owner, perché nel dataset SEC appiattito le righe transazione non hanno una foreign key verso uno specifico owner.
-5. Opzionalmente:
-   - limita a Officer/Director;
-   - elimina i filing marcati `AFF10B5ONE`.
-6. Costruisce un'etichetta **cluster** usando solo informazioni già pubbliche alla filing date.
-7. Può eseguire un event study gratuito con `yfinance`:
-   - ingresso all'OPEN della prima seduta successiva al filing;
-   - orizzonti 1 / 5 / 21 / 63 sedute;
-   - rendimento in eccesso rispetto a SPY.
+La v0.5 impone quindi:
+- entry = OPEN della prima seduta successiva al filing SEC;
+- la seduta deve cadere entro **7 giorni di calendario** dal filing;
+- altrimenti `price_status = stale_symbol_or_gap` e il record non entra nei rendimenti.
 
-## Installazione
+La sintesi aggiunge anche:
+- numero di issuer unici;
+- media semplice;
+- **media tagliata 1%** (rimozione dell'1% di coda per lato, solo a fini diagnostici);
+- mediana;
+- win rate vs SPY;
+- percentile 1 e 99.
 
-```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-# source .venv/bin/activate
-
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## User-Agent SEC
-
-L'app chiede una email di contatto e invia un User-Agent del tipo:
-
-`IndependentInsiderRadar/0.1 nome@email.it`
-
-Non inserire credenziali o password: serve soltanto a identificare correttamente l'accesso automatizzato al sito SEC.
-
-## Definizione cluster v0.4
-
-Per ogni nuovo giorno di filing SEC di una società, l'algoritmo guarda soltanto le transazioni che a quel momento risultano già pubbliche. Intorno alle date di transazione appena divulgate cerca acquisti di owner distinti entro `± window_days`. Se gli owner distinti raggiungono `min_insiders`, l'issuer-day è marcato come cluster.
-
-Questa scelta evita il look-ahead più grave: non viene usato un filing futuro per trasformare retroattivamente un vecchio acquisto in un segnale che all'epoca il pubblico non poteva conoscere.
-
-## Cosa NON fa ancora
-
-- Non risolve in modo completo Form 4/A e supersessioni.
-- Non interpreta le footnote.
-- Non distingue automaticamente acquisti open-market da private purchase: il codice SEC `P` comprende entrambi.
-- Non applica ancora filtri di liquidità, market cap, drawdown o fondamentali.
-- Non fornisce ancora inferenza statistica robusta (clustered standard errors / bootstrap per issuer-tempo).
-- Il dataset trimestrale SEC non copre il trimestre in corso in tempo reale; il live radar richiede un modulo EDGAR giornaliero separato.
-
-## Perché v0.4 è volutamente conservativa
-
-L'obiettivo non è costruire subito un “Insider Score”. Prima vogliamo rispondere a domande verificabili:
-
-- gli acquisti P hanno davvero vantaggio dopo la pubblicazione?
-- il vantaggio sopravvive usando la **filing date** e non la transaction date?
-- 2 o 3 insider sono migliori di uno solo?
-- l'effetto è concentrato nei primi giorni o persiste per mesi?
-
-Solo dopo questi test ha senso aggiungere market cap, fondamentali o scoring.
-
-
-## Correzione v0.4
-La SEC usa due percorsi diversi per gli ZIP trimestrali Insider Transactions.
-Il downloader prova automaticamente prima `structureddata` e poi `datastandardsinnovation`,
-così gestisce sia i trimestri storici sia quelli recenti senza modifiche manuali.
-
-
-## Novità v0.4
-- `NONE`/sentinel SEC non è più trattato come ticker Yahoo valido; il record SEC resta conservato.
-- Controvalori cluster >= $1 miliardo vengono marcati `value_review=True` ma non cancellati e non diventano uno score.
-- Download Yahoo in batch con retry per universi di migliaia di ticker.
-- Report separato della copertura prezzi e doppio export: vista corrente / tutti i segnali.
+Queste statistiche sono ancora descrittive. Il passo successivo corretto è aggiungere intervalli di confidenza/bootstrapping con dipendenza per issuer e separare il **primo trigger di cluster** dalle ripetizioni ravvicinate dello stesso episodio.
