@@ -16,7 +16,7 @@ from engine import (
 )
 
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.7")
+st.title("Independent Insider Radar — v0.8")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -71,7 +71,7 @@ with st.sidebar:
                 st.error(f"CSV non valido: {exc}")
 
 st.info(
-    "Regola v0.7: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
+    "Regola v0.8: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
     "common/ordinary shares, prezzo e quantità positivi. I filing con più reporting owner vengono "
     "scartati perché il dataset piatto SEC non attribuisce ogni riga transazione a uno specifico owner."
 )
@@ -185,10 +185,17 @@ if isinstance(signals, pd.DataFrame) and not signals.empty:
     )
     st.caption("Guardia anti-ticker riutilizzato/storico incompleto: l'entry Yahoo deve cadere entro 7 giorni di calendario dal filing SEC.")
     if st.button("3. Esegui event study 1/5/21/63 sedute"):
-        with st.spinner("Download prezzi e calcolo..."):
-            event, summary = backtest_signals(signals, max_entry_lag_days=7)
+        progress = st.progress(0.0)
+        status_box = st.empty()
+        def _progress(done, total, rows_done, rows_total):
+            progress.progress(min(done / max(total, 1), 1.0))
+            status_box.caption(f"Yahoo: blocco {done}/{total} • eventi elaborati {rows_done:,}/{rows_total:,}")
+        with st.spinner("Download prezzi a blocchi e calcolo progressivo..."):
+            event, summary = backtest_signals(signals, max_entry_lag_days=7, progress_callback=_progress)
             st.session_state["event"] = event
             st.session_state["summary"] = summary
+        progress.progress(1.0)
+        status_box.success("Event study completato.")
 
 summary = st.session_state.get("summary")
 event = st.session_state.get("event")
@@ -218,7 +225,7 @@ if isinstance(summary, pd.DataFrame) and not summary.empty:
     })
     st.dataframe(pretty, use_container_width=True, hide_index=True)
     st.warning(
-        "v0.7 mantiene la guardia anti-ticker riutilizzato/storico Yahoo incompleto e consente di riprendere il lavoro da insider_signals_all.csv. "
+        "v0.8 usa backtest Yahoo a memoria costante, mantiene la guardia anti-ticker riutilizzato/storico Yahoo incompleto e consente di riprendere il lavoro da insider_signals_all.csv. "
         "Le statistiche restano descrittive: la fase successiva deve aggiungere intervalli di confidenza e confronto cluster-vs-solo "
         "con dipendenza per issuer e periodo, oltre a separare il primo trigger di cluster dalle ripetizioni ravvicinate."
     )

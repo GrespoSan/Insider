@@ -535,22 +535,20 @@ def backtest_signals(
     signals: pd.DataFrame,
     horizons: tuple[int, ...] = (1, 5, 21, 63),
     benchmark: str = "SPY",
-    batch_size: int = 80,
+    batch_size: int = 60,
     max_entry_lag_days: int = 7,
+    progress_callback=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Free daily-price event study using Yahoo Finance.
-    Entry: next available trading session OPEN after SEC filing date.
+    Memory-safe Yahoo event study.
+
+    Instead of retaining the full price history for 2k+ symbols in RAM, this version
+    downloads one ticker batch, calculates all SEC events belonging to that batch,
+    releases the price frames, then continues. Benchmark SPY is held once.
+
+    Entry: next available trading-session OPEN after SEC filing date.
     Exit: CLOSE of horizon-th trading session starting at entry session.
     Excess return: stock return - benchmark return over the same dates.
-
-    Critical guard: the first available Yahoo session must be within max_entry_lag_days
-    calendar days after the SEC filing date. If it is later, the row is marked
-    stale_symbol_or_gap and excluded from returns. This prevents delisted/reused tickers
-    or incomplete Yahoo histories from turning a 2023 signal into a 2026 entry.
-
-    Rows with no usable public ticker are preserved with price_status='missing_ticker'.
-    Yahoo is downloaded in batches so a large SEC universe is less fragile.
     """
     if signals.empty:
         return signals.copy(), pd.DataFrame()
@@ -562,97 +560,119 @@ def backtest_signals(
     valid_symbols = sorted({s for s in sig["yahoo_symbol"].astype(str) if s})
     start = sig["signal_date"].min() - pd.Timedelta(days=10)
     end = sig["signal_date"].max() + pd.Timedelta(days=max(horizons) * 2 + 30)
-    prices = _download_yahoo_prices(valid_symbols + [benchmark], start, end, batch_size=batch_size)
-    bench = prices.get(benchmark, pd.DataFrame())
+
+    # Benchmark is small and kept once.
+    bench_map = _download_yahoo_prices([benchmark], start, end, batch_size=1)
+    bench = bench_map.get(benchmark, pd.DataFrame())
+    if not bench.empty:
+        bench = bench.copy()
+        bench.index = pd.DatetimeIndex([_naive_timestamp(x) for x in bench.index])
 
     rows: list[dict] = []
-    for _, row in sig.iterrows():
-        try:
-            sym = _safe_text(row.get("yahoo_symbol", ""))
-            base = row.to_dict()
-            for h in horizons:
-                base[f"ret_{h}"] = np.nan
-                base[f"spy_{h}"] = np.nan
-                base[f"excess_{h}"] = np.nan
-            if not sym:
-                base["price_status"] = "missing_ticker"
-                rows.append(base)
-                continue
-            px = prices.get(sym, pd.DataFrame())
-            if px.empty or bench.empty:
-                base["price_status"] = "missing_price"
-                rows.append(base)
-                continue
 
-            signal_ts = _naive_timestamp(row.get("signal_date"))
-            if pd.isna(signal_ts):
-                base["price_status"] = "invalid_signal_date"
-                rows.append(base)
-                continue
-            px = px.copy()
-            px.index = pd.DatetimeIndex([_naive_timestamp(x) for x in px.index])
-            bench_local = bench.copy()
-            bench_local.index = pd.DatetimeIndex([_naive_timestamp(x) for x in bench_local.index])
-            entry_candidates = px.index[px.index > signal_ts]
-            if len(entry_candidates) == 0:
-                base["price_status"] = "no_future_session"
-                rows.append(base)
-                continue
-            entry_date = _naive_timestamp(entry_candidates[0])
-            # Compare normalized calendar dates; this avoids tz-aware vs tz-naive TypeError.
-            entry_lag_days = int((entry_date.normalize() - signal_ts.normalize()).days)
-            base["entry_lag_days"] = entry_lag_days
-            if entry_lag_days > int(max_entry_lag_days):
+    def blank_base(row):
+        base = row.to_dict()
+        for h in horizons:
+            base[f"ret_{h}"] = np.nan
+            base[f"spy_{h}"] = np.nan
+            base[f"excess_{h}"] = np.nan
+        return base
+
+    # Preserve rows without usable ticker before Yahoo batches.
+    missing_mask = sig["yahoo_symbol"].map(lambda x: not bool(_safe_text(x)))
+    for _, row in sig[missing_mask].iterrows():
+        base = blank_base(row)
+        base["price_status"] = "missing_ticker"
+        rows.append(base)
+
+    n_batches = max(1, (len(valid_symbols) + batch_size - 1) // batch_size)
+    for batch_no, pos in enumerate(range(0, len(valid_symbols), batch_size), start=1):
+        batch = valid_symbols[pos:pos + batch_size]
+        prices = _download_yahoo_prices(batch, start, end, batch_size=len(batch))
+        batch_sig = sig[sig["yahoo_symbol"].isin(batch)]
+
+        for _, row in batch_sig.iterrows():
+            try:
+                sym = _safe_text(row.get("yahoo_symbol", ""))
+                base = blank_base(row)
+                px = prices.get(sym, pd.DataFrame())
+                if px.empty or bench.empty:
+                    base["price_status"] = "missing_price"
+                    rows.append(base)
+                    continue
+
+                signal_ts = _naive_timestamp(row.get("signal_date"))
+                if pd.isna(signal_ts):
+                    base["price_status"] = "invalid_signal_date"
+                    rows.append(base)
+                    continue
+
+                px = px.copy()
+                px.index = pd.DatetimeIndex([_naive_timestamp(x) for x in px.index])
+                entry_candidates = px.index[px.index > signal_ts]
+                if len(entry_candidates) == 0:
+                    base["price_status"] = "no_future_session"
+                    rows.append(base)
+                    continue
+
+                entry_date = _naive_timestamp(entry_candidates[0])
+                entry_lag_days = int((entry_date.normalize() - signal_ts.normalize()).days)
+                base["entry_lag_days"] = entry_lag_days
+                if entry_lag_days > int(max_entry_lag_days):
+                    base["entry_date"] = entry_date
+                    base["price_status"] = "stale_symbol_or_gap"
+                    rows.append(base)
+                    continue
+                if entry_date not in bench.index:
+                    base["price_status"] = "benchmark_missing_entry"
+                    rows.append(base)
+                    continue
+
+                entry_open = _scalar_float(px.loc[entry_date, "Open"])
+                bench_open = _scalar_float(bench.loc[entry_date, "Open"])
+                if not np.isfinite(entry_open) or entry_open <= 0 or not np.isfinite(bench_open) or bench_open <= 0:
+                    base["price_status"] = "bad_entry_price"
+                    rows.append(base)
+                    continue
+
+                loc = px.index.get_loc(entry_date)
+                if not isinstance(loc, (int, np.integer)):
+                    # Duplicate index rows are unusual; take the first exact location.
+                    loc = int(np.flatnonzero(px.index == entry_date)[0])
                 base["entry_date"] = entry_date
-                base["price_status"] = "stale_symbol_or_gap"
-                rows.append(base)
-                continue
-            if entry_date not in bench_local.index:
-                base["price_status"] = "benchmark_missing_entry"
-                rows.append(base)
-                continue
-            entry_open = _scalar_float(px.loc[entry_date, "Open"])
-            bench_open = _scalar_float(bench_local.loc[entry_date, "Open"])
-            if not np.isfinite(entry_open) or entry_open <= 0 or not np.isfinite(bench_open) or bench_open <= 0:
-                base["price_status"] = "bad_entry_price"
-                rows.append(base)
-                continue
+                base["entry_open"] = entry_open
+                base["price_status"] = "ok"
 
-            loc = px.index.get_loc(entry_date)
-            base["entry_date"] = entry_date
-            base["entry_open"] = entry_open
-            base["price_status"] = "ok"
-            for h in horizons:
-                exit_pos = loc + h - 1
-                if exit_pos >= len(px.index):
-                    base[f"ret_{h}"] = np.nan
-                    base[f"spy_{h}"] = np.nan
-                    base[f"excess_{h}"] = np.nan
-                    continue
-                exit_date = px.index[exit_pos]
-                if exit_date not in bench_local.index:
-                    base[f"ret_{h}"] = np.nan
-                    base[f"spy_{h}"] = np.nan
-                    base[f"excess_{h}"] = np.nan
-                    continue
-                stock_close = _scalar_float(px.loc[exit_date, "Close"])
-                spy_close = _scalar_float(bench_local.loc[exit_date, "Close"])
-                ret = stock_close / entry_open - 1.0
-                spy_ret = spy_close / bench_open - 1.0
-                base[f"ret_{h}"] = ret
-                base[f"spy_{h}"] = spy_ret
-                base[f"excess_{h}"] = ret - spy_ret
-            rows.append(base)
-        except Exception as exc:
-            # A malformed Yahoo/SEC row must not abort the full universe. Preserve it for audit.
-            err = row.to_dict()
-            for h in horizons:
-                err.setdefault(f"ret_{h}", np.nan)
-                err.setdefault(f"spy_{h}", np.nan)
-                err.setdefault(f"excess_{h}", np.nan)
-            err["price_status"] = f"row_error_{type(exc).__name__}"
-            err["price_error"] = str(exc)[:240]
-            rows.append(err)
+                for h in horizons:
+                    exit_pos = int(loc) + h - 1
+                    if exit_pos >= len(px.index):
+                        continue
+                    exit_date = px.index[exit_pos]
+                    if exit_date not in bench.index:
+                        continue
+                    stock_close = _scalar_float(px.iloc[exit_pos]["Close"])
+                    spy_close = _scalar_float(bench.loc[exit_date, "Close"])
+                    if not np.isfinite(stock_close) or stock_close <= 0 or not np.isfinite(spy_close) or spy_close <= 0:
+                        continue
+                    ret = stock_close / entry_open - 1.0
+                    spy_ret = spy_close / bench_open - 1.0
+                    base[f"ret_{h}"] = ret
+                    base[f"spy_{h}"] = spy_ret
+                    base[f"excess_{h}"] = ret - spy_ret
+                rows.append(base)
+            except Exception as exc:
+                err = blank_base(row)
+                err["price_status"] = f"row_error_{type(exc).__name__}"
+                err["price_error"] = str(exc)[:240]
+                rows.append(err)
+
+        # Release the potentially large Yahoo frames before the next batch.
+        del prices
+        if progress_callback is not None:
+            try:
+                progress_callback(batch_no, n_batches, len(rows), len(sig))
+            except Exception:
+                pass
 
     event = pd.DataFrame(rows)
     summary_rows: list[dict] = []
@@ -679,7 +699,6 @@ def backtest_signals(
             })
     summary = pd.DataFrame(summary_rows)
     return event, summary
-
 
 def normalize_loaded_signals(df: pd.DataFrame) -> pd.DataFrame:
     """Validate and normalize a previously exported insider_signals CSV.
