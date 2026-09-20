@@ -198,8 +198,128 @@ def issuer_cluster_bootstrap_difference(
     return pd.DataFrame(rows)
 
 
+
+def _role_flags(series: pd.Series) -> pd.DataFrame:
+    """Derive conservative role flags from the SEC role strings already in the signal export."""
+    x = series.fillna("").astype(str).str.upper()
+    return pd.DataFrame({
+        "has_ceo": x.str.contains(r"\\bCEO\\b|CHIEF EXECUTIVE", regex=True, na=False),
+        "has_cfo": x.str.contains(r"\\bCFO\\b|CHIEF FINANCIAL", regex=True, na=False),
+        "has_director": x.str.contains("DIRECTOR", regex=False, na=False),
+        "has_president": x.str.contains(r"\\bPRESIDENT\\b", regex=True, na=False),
+        "has_vp": x.str.contains(r"VICE PRESIDENT|\\bVP\\b", regex=True, na=False),
+    }, index=series.index)
+
+
+def enrich_first_cluster_features(labelled: pd.DataFrame) -> pd.DataFrame:
+    out = labelled.copy()
+    out["cluster_value"] = pd.to_numeric(out.get("cluster_value"), errors="coerce")
+    out["n_insiders"] = pd.to_numeric(out.get("n_insiders"), errors="coerce").fillna(1).astype(int)
+    if "value_review" in out.columns:
+        def _b(v):
+            if isinstance(v, (bool, np.bool_)):
+                return bool(v)
+            if pd.isna(v):
+                return False
+            return str(v).strip().lower() in {"true","1","yes","y","si","sì"}
+        out["value_review"] = out["value_review"].map(_b)
+    else:
+        out["value_review"] = False
+    roles = out["roles"] if "roles" in out.columns else pd.Series("", index=out.index)
+    flags = _role_flags(roles)
+    for c in flags.columns:
+        out[c] = flags[c]
+    out["has_ceo_or_cfo"] = out["has_ceo"] | out["has_cfo"]
+    out["has_ceo_and_cfo"] = out["has_ceo"] & out["has_cfo"]
+    bins = [-np.inf, 50_000, 100_000, 250_000, 1_000_000, np.inf]
+    labels = ["< $50k", "$50k–100k", "$100k–250k", "$250k–1M", "> $1M"]
+    out["value_bucket"] = pd.cut(out["cluster_value"], bins=bins, labels=labels, right=False)
+    return out
+
+
+def subset_summary(df: pd.DataFrame, group_name: str, horizons=(1,5,21,63)) -> pd.DataFrame:
+    rows=[]
+    for h in horizons:
+        col=f"excess_{h}"
+        if col not in df.columns:
+            continue
+        x=pd.to_numeric(df[col], errors="coerce").dropna()
+        if x.empty:
+            continue
+        lo,hi=x.quantile(.01),x.quantile(.99)
+        tr=x[(x>=lo)&(x<=hi)]
+        rows.append({
+            "segment": group_name,
+            "horizon_sessions": h,
+            "n": int(x.size),
+            "n_issuers": int(df.loc[x.index,"issuer_cik"].astype(str).nunique()),
+            "mean_excess": float(x.mean()),
+            "trimmed_mean_excess_1pct": float(tr.mean()) if not tr.empty else np.nan,
+            "median_excess": float(x.median()),
+            "win_rate_excess": float((x>0).mean()),
+        })
+    return pd.DataFrame(rows)
+
+
+def filtered_first_cluster_bootstrap(
+    labelled: pd.DataFrame,
+    mask: pd.Series,
+    *,
+    horizons=(1,5,21,63),
+    n_boot: int = 2000,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Issuer-cluster bootstrap: selected FIRST_CLUSTER segment minus SOLO."""
+    d=labelled.copy()
+    selected = d[mask & d["analysis_group"].eq("FIRST_CLUSTER")].copy()
+    solo = d[d["analysis_group"].eq("SOLO")].copy()
+    issuer_ids = pd.Index(pd.concat([selected["issuer_cik"], solo["issuer_cik"]]).dropna().astype(str).unique())
+    if selected.empty or solo.empty or len(issuer_ids)==0:
+        return pd.DataFrame()
+    rng=np.random.default_rng(seed)
+    pos={u:i for i,u in enumerate(issuer_ids)}
+    rows=[]
+    for h in horizons:
+        col=f"excess_{h}"
+        if col not in d.columns:
+            continue
+        a=selected[["issuer_cik",col]].copy(); b=solo[["issuer_cik",col]].copy()
+        a[col]=pd.to_numeric(a[col],errors="coerce"); b[col]=pd.to_numeric(b[col],errors="coerce")
+        a=a.dropna(subset=[col]); b=b.dropna(subset=[col])
+        if a.empty or b.empty:
+            continue
+        sa=np.zeros(len(issuer_ids)); ca=np.zeros(len(issuer_ids)); sb=np.zeros(len(issuer_ids)); cb=np.zeros(len(issuer_ids))
+        for u,g in a.groupby(a["issuer_cik"].astype(str)):
+            i=pos[u]; sa[i]=g[col].sum(); ca[i]=g[col].count()
+        for u,g in b.groupby(b["issuer_cik"].astype(str)):
+            i=pos[u]; sb[i]=g[col].sum(); cb[i]=g[col].count()
+        obs=float(a[col].mean()-b[col].mean())
+        boots=[]
+        for _ in range(int(n_boot)):
+            ix=rng.integers(0,len(issuer_ids),size=len(issuer_ids))
+            na=ca[ix].sum(); nb=cb[ix].sum()
+            if na<=0 or nb<=0:
+                continue
+            boots.append(sa[ix].sum()/na - sb[ix].sum()/nb)
+        if not boots:
+            continue
+        arr=np.asarray(boots)
+        low=float(np.quantile(arr,.025)); high=float(np.quantile(arr,.975))
+        rows.append({
+            "comparison":"SELECTED_FIRST_CLUSTER - SOLO",
+            "horizon_sessions":h,
+            "observed_diff":obs,
+            "ci95_low":low,
+            "ci95_high":high,
+            "bootstrap_reps":len(arr),
+            "n_selected":len(a),
+            "n_selected_issuers":a["issuer_cik"].astype(str).nunique(),
+            "robustly_above_zero":low>0,
+        })
+    return pd.DataFrame(rows)
+
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.9.1")
+st.title("Independent Insider Radar — v0.10")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -441,7 +561,7 @@ if isinstance(summary, pd.DataFrame) and not summary.empty:
 event_adv = st.session_state.get("event")
 if isinstance(event_adv, pd.DataFrame) and not event_adv.empty:
     st.divider()
-    st.header("Analisi FIRST CLUSTER — v0.9.1")
+    st.header("Analisi FIRST CLUSTER — v0.10")
     a1, a2 = st.columns(2)
     with a1:
         adv_min_insiders = st.selectbox("Soglia insider per cluster", [2, 3, 4], index=0, key="adv_min_insiders")
@@ -534,4 +654,128 @@ if isinstance(event_adv, pd.DataFrame) and not event_adv.empty:
         st.caption(
             "Per testare davvero finestre transazioni SEC diverse (±3/±5/±10/±20 giorni) serve ricostruire i segnali dai componenti Form 4, "
             "perché il CSV event study conserva il risultato della finestra usata in origine ma non tutte le singole transazioni necessarie a ricalcolarla."
+        )
+
+
+        st.divider()
+        st.header("Quali FIRST_CLUSTER contano davvero? — v0.10")
+        st.caption(
+            "Analisi esplorativa sui FIRST_CLUSTER già definiti. Nessuno score: separiamo il campione per controvalore e ruolo. "
+            "Le righe value_review (controvalori SEC estremi marcati in precedenza) sono escluse dalle tabelle per valore."
+        )
+        enriched = enrich_first_cluster_features(labelled)
+        fc_base = enriched[enriched["analysis_group"].eq("FIRST_CLUSTER")].copy()
+        fc_clean_value = fc_base[~fc_base["value_review"]].copy()
+
+        # Value buckets
+        st.subheader("FIRST_CLUSTER per controvalore aggregato")
+        val_rows=[]
+        bucket_order=["< $50k", "$50k–100k", "$100k–250k", "$250k–1M", "> $1M"]
+        for bucket in bucket_order:
+            g=fc_clean_value[fc_clean_value["value_bucket"].astype(str).eq(bucket)]
+            sm=subset_summary(g,bucket)
+            if not sm.empty:
+                val_rows.append(sm)
+        if val_rows:
+            vt=pd.concat(val_rows,ignore_index=True)
+            vp=vt.copy()
+            for c in ["mean_excess","trimmed_mean_excess_1pct","median_excess","win_rate_excess"]:
+                vp[c]=(vp[c]*100).round(2)
+            vp=vp.rename(columns={
+                "mean_excess":"mean_excess_%",
+                "trimmed_mean_excess_1pct":"trimmed_mean_1pct_%",
+                "median_excess":"median_excess_%",
+                "win_rate_excess":"win_rate_excess_%",
+            })
+            st.dataframe(vp,use_container_width=True,hide_index=True)
+
+        # Role buckets
+        st.subheader("FIRST_CLUSTER per ruolo presente")
+        role_defs={
+            "CEO presente": fc_base["has_ceo"],
+            "CFO presente": fc_base["has_cfo"],
+            "CEO + CFO": fc_base["has_ceo_and_cfo"],
+            "Director presente": fc_base["has_director"],
+            "3+ insider": fc_base["n_insiders"].ge(3),
+            "3+ insider + CEO/CFO": fc_base["n_insiders"].ge(3) & fc_base["has_ceo_or_cfo"],
+            "3+ insider + CEO+CFO": fc_base["n_insiders"].ge(3) & fc_base["has_ceo_and_cfo"],
+        }
+        role_rows=[]
+        for name, m in role_defs.items():
+            sm=subset_summary(fc_base[m],name)
+            if not sm.empty:
+                role_rows.append(sm)
+        if role_rows:
+            rt=pd.concat(role_rows,ignore_index=True)
+            rp=rt.copy()
+            for c in ["mean_excess","trimmed_mean_excess_1pct","median_excess","win_rate_excess"]:
+                rp[c]=(rp[c]*100).round(2)
+            rp=rp.rename(columns={
+                "mean_excess":"mean_excess_%",
+                "trimmed_mean_excess_1pct":"trimmed_mean_1pct_%",
+                "median_excess":"median_excess_%",
+                "win_rate_excess":"win_rate_excess_%",
+            })
+            st.dataframe(rp,use_container_width=True,hide_index=True)
+
+        st.subheader("Filtro combinato + bootstrap vs SOLO")
+        f1,f2,f3=st.columns(3)
+        with f1:
+            focus_min_n=st.selectbox("Insider minimi",[2,3,4],index=1,key="focus_min_n")
+        with f2:
+            focus_value=st.selectbox("Controvalore cluster",[
+                "Tutti","< $50k","$50k–100k","$100k–250k","$250k–1M","> $1M"
+            ],index=0,key="focus_value")
+        with f3:
+            focus_role=st.selectbox("Ruolo",[
+                "Qualsiasi","CEO presente","CFO presente","CEO o CFO","CEO + CFO","Director presente"
+            ],index=0,key="focus_role")
+
+        mask = enriched["n_insiders"].ge(int(focus_min_n)) & enriched["analysis_group"].eq("FIRST_CLUSTER")
+        if focus_value != "Tutti":
+            mask &= enriched["value_bucket"].astype(str).eq(focus_value) & ~enriched["value_review"]
+        if focus_role == "CEO presente": mask &= enriched["has_ceo"]
+        elif focus_role == "CFO presente": mask &= enriched["has_cfo"]
+        elif focus_role == "CEO o CFO": mask &= enriched["has_ceo_or_cfo"]
+        elif focus_role == "CEO + CFO": mask &= enriched["has_ceo_and_cfo"]
+        elif focus_role == "Director presente": mask &= enriched["has_director"]
+
+        selected=enriched[mask].copy()
+        st.metric("FIRST_CLUSTER selezionati",f"{len(selected):,}")
+        sel_sm=subset_summary(selected,"SELECTED_FIRST_CLUSTER")
+        if sel_sm.empty:
+            st.warning("Nessun evento prezzato con questi filtri.")
+        else:
+            sp=sel_sm.copy()
+            for c in ["mean_excess","trimmed_mean_excess_1pct","median_excess","win_rate_excess"]:
+                sp[c]=(sp[c]*100).round(2)
+            sp=sp.rename(columns={
+                "mean_excess":"mean_excess_%",
+                "trimmed_mean_excess_1pct":"trimmed_mean_1pct_%",
+                "median_excess":"median_excess_%",
+                "win_rate_excess":"win_rate_excess_%",
+            })
+            st.dataframe(sp,use_container_width=True,hide_index=True)
+            with st.spinner("Bootstrap issuer del segmento selezionato vs SOLO..."):
+                fb=filtered_first_cluster_bootstrap(enriched,mask,n_boot=2000,seed=42)
+            if not fb.empty:
+                fbp=fb.copy()
+                for c in ["observed_diff","ci95_low","ci95_high"]:
+                    fbp[c]=(fbp[c]*100).round(2)
+                fbp=fbp.rename(columns={
+                    "observed_diff":"diff_media_%",
+                    "ci95_low":"CI95_low_%",
+                    "ci95_high":"CI95_high_%",
+                    "robustly_above_zero":"CI_interamente_>0",
+                })
+                st.dataframe(fbp,use_container_width=True,hide_index=True)
+                if fb["robustly_above_zero"].any():
+                    hs=", ".join(str(int(x)) for x in fb.loc[fb["robustly_above_zero"],"horizon_sessions"])
+                    st.success(f"Per questo segmento il CI95% è interamente sopra zero a: {hs} sedute.")
+                else:
+                    st.warning("Per questo segmento il CI95% attraversa ancora zero a tutti gli orizzonti.")
+
+        st.caption(
+            "Attenzione al data-mining: queste segmentazioni sono esplorative. Un filtro che sembra migliore sullo stesso campione 2022–2026 "
+            "deve essere validato fuori campione o con walk-forward prima di essere considerato un edge."
         )
