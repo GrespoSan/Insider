@@ -26,3 +26,17 @@ def test_no_future_filing_lookahead():
 if __name__ == "__main__":
     test_no_future_filing_lookahead()
     print("OK")
+
+
+def test_missing_issuer_name_uses_ticker_fallback():
+    rows = [
+        dict(ACCESSION_NUMBER="A1", ISSUERCIK="77", ISSUERNAME=None, ISSUERTRADINGSYMBOL="MISS",
+             RPTOWNERCIK="701", RPTOWNERNAME="Alice", RPTOWNER_RELATIONSHIP="OFFICER", RPTOWNER_TITLE="CEO",
+             FILING_DATE=pd.Timestamp("2026-02-05"), TRANS_DATE=pd.Timestamp("2026-02-03"),
+             DIRECT_INDIRECT_OWNERSHIP="D", SECURITY_TITLE="Common Stock", shares=100, trade_value=10000,
+             n_tranches=1, vwap=100, filing_lag_days=2),
+    ]
+    sig = build_issuer_day_signals(pd.DataFrame(rows), window_days=10, min_insiders=2)
+    assert len(sig) == 1
+    assert sig.iloc[0].ticker == "MISS"
+    assert sig.iloc[0].issuer_name == "MISS"

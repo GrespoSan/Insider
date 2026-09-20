@@ -15,7 +15,7 @@ from engine import (
 )
 
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.2")
+st.title("Independent Insider Radar — v0.3")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -42,7 +42,7 @@ with st.sidebar:
     min_insiders = st.slider("Insider distinti minimi", 2, 6, 2)
 
 st.info(
-    "Regola v0.2: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
+    "Regola v0.3: Form 4 originale, transazione non-derivata con codice P e A (acquired), "
     "common/ordinary shares, prezzo e quantità positivi. I filing con più reporting owner vengono "
     "scartati perché il dataset piatto SEC non attribuisce ogni riga transazione a uno specifico owner."
 )
@@ -152,7 +152,7 @@ if isinstance(summary, pd.DataFrame) and not summary.empty:
     })
     st.dataframe(pretty, use_container_width=True, hide_index=True)
     st.warning(
-        "v0.2 riporta statistiche descrittive, non significatività robusta. "
+        "v0.3 riporta statistiche descrittive, non significatività robusta. "
         "La fase successiva deve aggiungere intervalli di confidenza e confronto cluster-vs-solo "
         "con dipendenza per issuer e periodo."
     )

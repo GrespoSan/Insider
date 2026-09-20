@@ -365,8 +365,25 @@ def build_issuer_day_signals(
             new_value = float(newly_public["trade_value"].sum())
             total_value = float(best["trade_value"].sum())
             accessions = sorted(set(best["ACCESSION_NUMBER"].astype(str)))
-            ticker = str(newly_public["ISSUERTRADINGSYMBOL"].dropna().iloc[0])
-            issuer_name = str(newly_public["ISSUERNAME"].dropna().iloc[0])
+            # SEC occasionally leaves ISSUERNAME blank even when the ticker is valid.
+            # Never let a missing display label invalidate an otherwise usable purchase.
+            ticker_values = (
+                newly_public["ISSUERTRADINGSYMBOL"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+            )
+            ticker_values = ticker_values[ticker_values.ne("")]
+            ticker = ticker_values.iloc[0] if not ticker_values.empty else str(issuer)
+
+            issuer_values = (
+                newly_public["ISSUERNAME"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+            )
+            issuer_values = issuer_values[issuer_values.ne("")]
+            issuer_name = issuer_values.iloc[0] if not issuer_values.empty else ticker
 
             results.append({
                 "issuer_cik": str(issuer),
