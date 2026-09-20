@@ -13,9 +13,13 @@ import numpy as np
 import pandas as pd
 import requests
 
-SEC_BULK_URL = (
+SEC_BULK_URLS = (
+    # Percorso storico/attuale usato dalla maggior parte dei trimestri SEC.
+    "https://www.sec.gov/files/structureddata/data/"
+    "insider-transactions-data-sets/{year}q{quarter}_form345.zip",
+    # Nuovo percorso comparso per alcuni dataset recenti (es. 2026 Q2).
     "https://www.sec.gov/files/datastandardsinnovation/data/"
-    "insider-transactions-data-sets/{year}q{quarter}_form345.zip"
+    "insider-transactions-data-sets/{year}q{quarter}_form345.zip",
 )
 
 TRUE_VALUES = {"1", "true", "t", "yes", "y"}
@@ -43,8 +47,13 @@ class Quarter:
         return f"{self.year}q{self.quarter}_form345.zip"
 
     @property
+    def urls(self) -> list[str]:
+        return [u.format(year=self.year, quarter=self.quarter) for u in SEC_BULK_URLS]
+
+    @property
     def url(self) -> str:
-        return SEC_BULK_URL.format(year=self.year, quarter=self.quarter)
+        # Compatibilità: restituisce l'URL primario, ma il downloader prova tutti i fallback.
+        return self.urls[0]
 
 
 def quarter_range(start_year: int, start_quarter: int, end_year: int, end_quarter: int) -> list[Quarter]:
@@ -86,15 +95,44 @@ def download_quarter(q: Quarter, data_dir: str | Path, contact_email: str, timeo
     if dest.exists() and dest.stat().st_size > 1000:
         return dest
 
-    r = requests.get(q.url, headers=_headers(contact_email), timeout=timeout)
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
-    if len(r.content) < 1000:
-        raise RuntimeError(f"Download SEC anomalo per {q.label}: file troppo piccolo.")
-    dest.write_bytes(r.content)
-    time.sleep(0.15)
-    return dest
+    last_error: Exception | None = None
+    for url in q.urls:
+        try:
+            r = requests.get(url, headers=_headers(contact_email), timeout=timeout)
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+
+        if r.status_code == 404:
+            continue
+        try:
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+
+        if len(r.content) < 1000:
+            last_error = RuntimeError(
+                f"Download SEC anomalo per {q.label} da {url}: file troppo piccolo."
+            )
+            continue
+
+        # Controllo minimo: deve essere davvero uno ZIP valido prima di salvarlo.
+        try:
+            with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+                if not zf.namelist():
+                    raise RuntimeError("ZIP vuoto")
+        except Exception as exc:
+            last_error = RuntimeError(f"Risposta non valida per {q.label} da {url}: {exc}")
+            continue
+
+        dest.write_bytes(r.content)
+        time.sleep(0.15)
+        return dest
+
+    if last_error is not None:
+        raise RuntimeError(f"Impossibile scaricare {q.label}: {last_error}") from last_error
+    return None
 
 
 def _member_name(zf: zipfile.ZipFile, wanted: str) -> str:
