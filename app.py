@@ -737,7 +737,7 @@ def backtest_signals_checkpointed_local(
     return event, _event_summary_checkpoint_local(event, horizons)
 
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.14")
+st.title("Independent Insider Radar — v0.14.1")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -2000,20 +2000,190 @@ if isinstance(robust_event, pd.DataFrame) and not robust_event.empty:
 else:
     st.info("Per il Robustness Audit carica il CSV completo insider_event_study_2006_2021.csv oppure completa/carica H3-H4 sopra.")
 
+
+
+# --- v0.14.1 deployment-safe Value Normalization helpers ------------------
+# Kept locally so the audit still works if Streamlit Cloud temporarily loads
+# an older cached engine.py. These are intentionally identical in logic to
+# the v0.14 engine helpers and do not alter the frozen research rules.
+CPI_U_ANNUAL_V0141 = {
+    2006: 201.600, 2007: 207.342, 2008: 215.303, 2009: 214.537,
+    2010: 218.056, 2011: 224.939, 2012: 229.594, 2013: 232.957,
+    2014: 236.736, 2015: 237.017, 2016: 240.007, 2017: 245.120,
+    2018: 251.107, 2019: 255.657, 2020: 258.811, 2021: 270.970,
+    2022: 292.655, 2023: 304.702, 2024: 313.689, 2025: 321.943,
+    2026: 334.980,
+}
+CPI_2026_REFERENCE_V0141 = CPI_U_ANNUAL_V0141[2026]
+
+def real_band_nominal_thresholds_2026_local(lower_2026=100_000.0, upper_2026=250_000.0, years=None):
+    if years is None:
+        years = sorted(CPI_U_ANNUAL_V0141)
+    rows = []
+    for y in years:
+        y = int(y)
+        cpi = CPI_U_ANNUAL_V0141.get(y)
+        if cpi is None:
+            continue
+        factor = float(cpi) / float(CPI_2026_REFERENCE_V0141)
+        rows.append({
+            "year": y,
+            "cpi_u": float(cpi),
+            "nominal_lower_equiv": float(lower_2026 * factor),
+            "nominal_upper_equiv": float(upper_2026 * factor),
+            "inflation_factor_to_2026": float(CPI_2026_REFERENCE_V0141 / cpi),
+        })
+    return pd.DataFrame(rows)
+
+def add_real_value_columns_local(df, value_col="cluster_value", date_col="signal_date", lower_2026=100_000.0, upper_2026=250_000.0):
+    out = df.copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    out["signal_year"] = out[date_col].dt.year.astype("Int64")
+    out[value_col] = pd.to_numeric(out.get(value_col), errors="coerce")
+    years = out["signal_year"].astype("Int64")
+    cpis = years.map(CPI_U_ANNUAL_V0141).astype(float)
+    out["cpi_u_signal_year"] = cpis
+    out["cluster_value_2026"] = out[value_col] * (float(CPI_2026_REFERENCE_V0141) / cpis)
+    out["value_band_nominal_100_250"] = out[value_col].ge(lower_2026) & out[value_col].lt(upper_2026)
+    out["value_band_real_2026_100_250"] = out["cluster_value_2026"].ge(lower_2026) & out["cluster_value_2026"].lt(upper_2026)
+    out["cpi_supported"] = cpis.notna()
+    return out
+
+def _value_norm_stats_local(x):
+    x = pd.to_numeric(x, errors="coerce").dropna().astype(float)
+    if x.empty:
+        return {"n":0, "mean_excess":np.nan, "trimmed_mean_excess_1pct":np.nan, "median_excess":np.nan, "win_rate_excess":np.nan}
+    lo, hi = x.quantile(0.01), x.quantile(0.99)
+    trim = x[(x >= lo) & (x <= hi)]
+    return {
+        "n": int(len(x)),
+        "mean_excess": float(x.mean()),
+        "trimmed_mean_excess_1pct": float(trim.mean()) if len(trim) else np.nan,
+        "median_excess": float(x.median()),
+        "win_rate_excess": float((x > 0).mean()),
+    }
+
+def value_normalization_audit_local(event, *, period_label, start_date=None, end_date=None, episode_gap_days=10, horizons=(1,5)):
+    d = normalize_loaded_event_study(event)
+    d["signal_date"] = pd.to_datetime(d["signal_date"], errors="coerce")
+    if start_date is not None:
+        d = d[d["signal_date"] >= pd.Timestamp(start_date)]
+    if end_date is not None:
+        d = d[d["signal_date"] <= pd.Timestamp(end_date)]
+    labelled = label_cluster_episodes(d, min_insiders=3, episode_gap_days=episode_gap_days)
+    b = labelled[labelled["analysis_group"].eq("FIRST_CLUSTER")].copy()
+    if "value_review" in b.columns:
+        def _bool_v0141(v):
+            if isinstance(v, (bool, np.bool_)):
+                return bool(v)
+            if pd.isna(v):
+                return False
+            return str(v).strip().lower() in {"true","1","yes","y","si","sì"}
+        b["value_review"] = b["value_review"].map(_bool_v0141)
+    else:
+        b["value_review"] = False
+    b = add_real_value_columns_local(b)
+    masks = {
+        "B · FIRST_CLUSTER ≥3": pd.Series(True, index=b.index),
+        "C-NOMINAL · ≥3 + $100k–250k nominali": b["value_band_nominal_100_250"] & ~b["value_review"],
+        "C-REAL · ≥3 + $100k–250k in $2026": b["value_band_real_2026_100_250"] & ~b["value_review"] & b["cpi_supported"],
+    }
+    rows = []
+    for rule, mask in masks.items():
+        sub = b.loc[mask]
+        for h in horizons:
+            col = f"excess_{h}"
+            if col not in sub.columns:
+                continue
+            stats = _value_norm_stats_local(sub[col])
+            valid_idx = pd.to_numeric(sub[col], errors="coerce").dropna().index
+            rows.append({
+                "period": period_label, "rule": rule, "horizon_sessions": int(h),
+                "selected_events": int(len(sub)), "n": stats["n"],
+                "n_issuers": int(sub.loc[valid_idx, "issuer_cik"].astype(str).nunique()) if len(valid_idx) else 0,
+                "mean_excess": stats["mean_excess"],
+                "trimmed_mean_excess_1pct": stats["trimmed_mean_excess_1pct"],
+                "median_excess": stats["median_excess"], "win_rate_excess": stats["win_rate_excess"],
+            })
+    nom = b["value_band_nominal_100_250"] & ~b["value_review"]
+    real = b["value_band_real_2026_100_250"] & ~b["value_review"] & b["cpi_supported"]
+    overlap = pd.DataFrame([{
+        "period": period_label, "B_events": int(len(b)),
+        "C_nominal_events": int(nom.sum()), "C_real_events": int(real.sum()),
+        "both_nominal_and_real": int((nom & real).sum()),
+        "nominal_only": int((nom & ~real).sum()), "real_only": int((real & ~nom).sum()),
+        "neither": int((~nom & ~real).sum()),
+    }])
+    return b, pd.DataFrame(rows), overlap
+
+def value_band_incremental_bootstrap_local(b_enriched, *, band_col, label, horizons=(1,5), n_boot=2000, seed=1414):
+    d = b_enriched.copy()
+    if band_col not in d.columns:
+        raise ValueError(f"Colonna {band_col} non presente")
+    mask_a = d[band_col].fillna(False).astype(bool)
+    if "value_review" in d.columns:
+        mask_a &= ~d["value_review"].fillna(False).astype(bool)
+    mask_b = ~mask_a
+    issuers = d["issuer_cik"].fillna("").astype(str).unique()
+    rng = np.random.default_rng(seed)
+    rows = []
+    for h in horizons:
+        col = f"excess_{h}"
+        if col not in d.columns:
+            continue
+        z = d[["issuer_cik", col]].copy()
+        z["_A"] = mask_a.values
+        z["_B"] = mask_b.values
+        z[col] = pd.to_numeric(z[col], errors="coerce")
+        z = z.dropna(subset=[col])
+        a = z[z["_A"]]
+        bb = z[z["_B"]]
+        if a.empty or bb.empty:
+            continue
+        obs = float(a[col].mean() - bb[col].mean())
+        pos = {u:i for i,u in enumerate(issuers)}
+        sa=np.zeros(len(issuers)); ca=np.zeros(len(issuers)); sb=np.zeros(len(issuers)); cb=np.zeros(len(issuers))
+        for issuer,g in z.groupby("issuer_cik"):
+            i = pos.get(str(issuer))
+            if i is None:
+                continue
+            ga=g[g["_A"]]; gb=g[g["_B"]]
+            if len(ga): sa[i]=ga[col].sum(); ca[i]=len(ga)
+            if len(gb): sb[i]=gb[col].sum(); cb[i]=len(gb)
+        boots=[]
+        for _ in range(int(n_boot)):
+            samp=rng.integers(0,len(issuers),size=len(issuers))
+            na=ca[samp].sum(); nb=cb[samp].sum()
+            if na<=0 or nb<=0:
+                continue
+            boots.append(sa[samp].sum()/na - sb[samp].sum()/nb)
+        if not boots:
+            continue
+        arr=np.asarray(boots,float)
+        rows.append({
+            "band": label, "horizon_sessions": int(h),
+            "observed_diff_vs_B_rest": obs,
+            "ci95_low": float(np.quantile(arr,0.025)), "ci95_high": float(np.quantile(arr,0.975)),
+            "bootstrap_reps": int(len(arr)), "n_band": int(len(a)), "n_B_rest": int(len(bb)),
+            "n_issuers": int(len(issuers)), "robustly_above_zero": bool(np.quantile(arr,0.025)>0),
+        })
+    return pd.DataFrame(rows)
+
+
 # --- v0.14: Value Normalization Audit --------------------------------------
 st.divider()
-st.header("Value Normalization Audit — v0.14")
+st.header("Value Normalization Audit — v0.14.1")
 st.caption(
     "Controllo dell'osservazione economica: $100k–250k nominali nel 2006 non hanno lo stesso peso di $100k–250k nel 2026. "
     "La regola CORE B (FIRST_CLUSTER ≥3 insider) resta congelata. Confrontiamo soltanto C-NOMINAL con C-REAL corretto per CPI-U."
 )
 st.warning(
     "Nessuna ottimizzazione della fascia: C-REAL è definita meccanicamente come $100k–250k espressi in dollari 2026. "
-    "Per il 2006–2025 usiamo il CPI-U annuale medio; il riferimento 2026 è l'indice CPI-U di agosto 2026 (334.980), ultimo disponibile alla costruzione della v0.14."
+    "Per il 2006–2025 usiamo il CPI-U annuale medio; il riferimento 2026 è l'indice CPI-U di agosto 2026 (334.980), ultimo disponibile alla costruzione della v0.14.1."
 )
 
 # CPI-equivalent thresholds are deterministic and visible before looking at returns.
-thresholds_v014 = engine_mod.real_band_nominal_thresholds_2026()
+thresholds_v014 = real_band_nominal_thresholds_2026_local()
 tshow = thresholds_v014.copy()
 tshow["nominal_lower_equiv"] = tshow["nominal_lower_equiv"].round(0)
 tshow["nominal_upper_equiv"] = tshow["nominal_upper_equiv"].round(0)
@@ -2033,7 +2203,7 @@ with u1:
     )
     if hist_norm_upload is not None and st.button("Usa storico per Value Audit", key="use_value_norm_hist_v014", use_container_width=True):
         try:
-            z = engine_mod.normalize_loaded_event_study(pd.read_csv(hist_norm_upload, low_memory=False))
+            z = normalize_loaded_event_study(pd.read_csv(hist_norm_upload, low_memory=False))
             st.session_state["value_norm_hist_v014"] = z
             st.success(f"Storico caricato: {len(z):,} righe.")
         except Exception as exc:
@@ -2045,7 +2215,7 @@ with u2:
     )
     if recent_norm_upload is not None and st.button("Usa recente per Value Audit", key="use_value_norm_recent_v014", use_container_width=True):
         try:
-            z = engine_mod.normalize_loaded_event_study(pd.read_csv(recent_norm_upload, low_memory=False))
+            z = normalize_loaded_event_study(pd.read_csv(recent_norm_upload, low_memory=False))
             st.session_state["value_norm_recent_v014"] = z
             st.success(f"Periodo recente caricato: {len(z):,} righe.")
         except Exception as exc:
@@ -2073,7 +2243,7 @@ overlap_frames = []
 bootstrap_frames = []
 
 if isinstance(hist_norm_event, pd.DataFrame) and not hist_norm_event.empty:
-    bh, sh, oh = engine_mod.value_normalization_audit(
+    bh, sh, oh = value_normalization_audit_local(
         hist_norm_event,
         period_label="2006–2021",
         start_date="2006-01-01", end_date="2021-12-31",
@@ -2084,14 +2254,14 @@ if isinstance(hist_norm_event, pd.DataFrame) and not hist_norm_event.empty:
         ("value_band_nominal_100_250", "C-NOMINAL vs resto B"),
         ("value_band_real_2026_100_250", "C-REAL vs resto B"),
     ]:
-        bt = engine_mod.value_band_incremental_bootstrap(bh, band_col=col, label=label, horizons=(1,5), n_boot=2000, seed=1414)
+        bt = value_band_incremental_bootstrap_local(bh, band_col=col, label=label, horizons=(1,5), n_boot=2000, seed=1414)
         if not bt.empty:
             bt.insert(0, "period", "2006–2021"); bootstrap_frames.append(bt)
     q=bh[[c for c in ["issuer_cik","ticker","signal_date","cluster_value","cluster_value_2026","value_band_nominal_100_250","value_band_real_2026_100_250","excess_1","excess_5"] if c in bh.columns]].copy()
     q.insert(0,"period","2006–2021"); value_audit_parts.append(q)
 
 if isinstance(recent_norm_event, pd.DataFrame) and not recent_norm_event.empty:
-    br, sr, orr = engine_mod.value_normalization_audit(
+    br, sr, orr = value_normalization_audit_local(
         recent_norm_event,
         period_label="2022–2026",
         start_date="2022-01-01", end_date="2026-12-31",
@@ -2102,7 +2272,7 @@ if isinstance(recent_norm_event, pd.DataFrame) and not recent_norm_event.empty:
         ("value_band_nominal_100_250", "C-NOMINAL vs resto B"),
         ("value_band_real_2026_100_250", "C-REAL vs resto B"),
     ]:
-        bt = engine_mod.value_band_incremental_bootstrap(br, band_col=col, label=label, horizons=(1,5), n_boot=2000, seed=1415)
+        bt = value_band_incremental_bootstrap_local(br, band_col=col, label=label, horizons=(1,5), n_boot=2000, seed=1415)
         if not bt.empty:
             bt.insert(0, "period", "2022–2026"); bootstrap_frames.append(bt)
     q=br[[c for c in ["issuer_cik","ticker","signal_date","cluster_value","cluster_value_2026","value_band_nominal_100_250","value_band_real_2026_100_250","excess_1","excess_5"] if c in br.columns]].copy()
@@ -2165,9 +2335,9 @@ if summary_frames:
     x=thresholds_v014.copy(); x.insert(0,"table","cpi_thresholds"); export_parts.append(x)
     audit_export=pd.concat(export_parts,ignore_index=True,sort=False)
     st.download_button(
-        "Scarica Value Normalization Audit v0.14 CSV",
+        "Scarica Value Normalization Audit v0.14.1 CSV",
         audit_export.to_csv(index=False).encode("utf-8"),
-        file_name="insider_value_normalization_audit_v0_14.csv",
+        file_name="insider_value_normalization_audit_v0_14_1.csv",
         mime="text/csv",
     )
 else:
