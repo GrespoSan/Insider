@@ -248,21 +248,30 @@ if not view.empty:
     st.subheader("🎯 DA GUARDARE OGGI")
     st.caption(
         "Questa è la lista principale: **solo NUOVI CORE e CORE ancora nella finestra 1–4/5 sedute**. "
-        "Il radar non è un segnale automatico di acquisto: usa **TV** per verificare il grafico e il contesto."
+        "**P/L da Entry** parte dall'OPEN della prima seduta successiva al filing SEC; **Vs SPY** mostra l'excess return sullo stesso intervallo. "
+        "Per i segnali 0/5 i valori restano vuoti finché non esiste una seduta di ingresso. Usa **TV** per verificare il grafico e il contesto."
     )
     if today_focus.empty:
         st.info("Nessun NUOVO CORE o CORE ATTIVO con i filtri correnti.")
     else:
         focus_cols = [c for c in [
-            "ticker", "issuer_name", "n_insiders", "day_5", "cluster_value",
+            "ticker", "issuer_name", "n_insiders", "day_5",
+            "return_since_entry", "excess_since_entry", "cluster_value",
             "value_flag", "role_tag", "tradingview_url", "sec_url"
         ] if c in today_focus.columns]
         focus_show = today_focus[focus_cols].copy()
+        # P/L e excess sono espressi come frazioni nel motore (0.034 = +3.4%).
+        # Li convertiamo in punti percentuali solo per la visualizzazione.
+        for pct_col in ["return_since_entry", "excess_since_entry"]:
+            if pct_col in focus_show.columns:
+                focus_show[pct_col] = pd.to_numeric(focus_show[pct_col], errors="coerce") * 100.0
         focus_cfg = {
             "ticker": st.column_config.TextColumn("Ticker"),
             "issuer_name": st.column_config.TextColumn("Società"),
             "n_insiders": st.column_config.NumberColumn("Insider", format="%d"),
             "day_5": st.column_config.TextColumn("Giorno"),
+            "return_since_entry": st.column_config.NumberColumn("P/L da Entry %", format="%.2f%%"),
+            "excess_since_entry": st.column_config.NumberColumn("Vs SPY %", format="%.2f%%"),
             "cluster_value": st.column_config.NumberColumn("Valore", format="$ %.0f"),
             "value_flag": st.column_config.TextColumn("VALUE"),
             "role_tag": st.column_config.TextColumn("Ruoli"),
@@ -396,7 +405,7 @@ if not view.empty:
     )
 
 st.divider()
-st.header("Forward Registry — v1.3.1")
+st.header("Forward Registry — v1.3.2.1")
 registry = load_forward_registry(STATE_DIR)
 meta = load_forward_registry_meta(STATE_DIR)
 if registry.empty:
@@ -418,7 +427,7 @@ else:
     rcols[4].metric("Avvio registro", str(meta.get("initialized_at", "—"))[:10])
 
     st.caption(
-        "I segnali già presenti al primo avvio della v1.2/v1.3/v1.3.1 sono marcati **BASELINE** e restano separati dal vero test prospettico. "
+        "I segnali già presenti al primo avvio della v1.2/v1.3/v1.3.1/v1.3.2 sono marcati **BASELINE** e restano separati dal vero test prospettico. "
         "Solo i segnali comparsi successivamente sono **FORWARD**. Una volta raggiunte 5 sedute, Ret 5 ed Excess 5 vengono congelati e non riscritti dai refresh successivi."
     )
 
@@ -451,7 +460,7 @@ else:
     st.download_button(
         "Scarica Forward Registry CSV",
         data=reg.to_csv(index=False).encode("utf-8"),
-        file_name="insider_forward_registry_v1_3.csv",
+        file_name="insider_forward_registry_v1_3_2.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -460,7 +469,7 @@ st.divider()
 with st.expander("Metodo congelato e limiti"):
     st.markdown(
         """
-- **Forward Registry v1.3.1:** il primo avvio crea una BASELINE separata; soltanto i segnali successivi sono FORWARD. A 5 sedute il risultato viene congelato e non viene riscritto.
+- **Forward Registry v1.3.2:** il primo avvio crea una BASELINE separata; soltanto i segnali successivi sono FORWARD. A 5 sedute il risultato viene congelato e non viene riscritto.
 - **Fonte:** SEC EDGAR Form 4 originali. Il radar mantiene solo acquisti **P** di common/ordinary shares, acquisizione **A**, prezzo e quantità positivi.
 - **Attribuzione prudente:** filing con più reporting owner vengono scartati; vengono mantenuti Officer/Director; 10b5-1 viene escluso quando esplicitamente marcato.
 - **Componente minimo:** $10.000, come nella ricerca congelata.
