@@ -1,4 +1,4 @@
-# Independent Insider Radar LIVE v1.3.2.2
+# Independent Insider Radar LIVE v1.3.3
 
 Versione operativa con **Forward Registry automatico**.
 
@@ -9,9 +9,9 @@ Versione operativa con **Forward Registry automatico**.
 - Orizzonte empirico principale = 5 sedute
 
 ## Forward Registry
-La v1.3.2 salva automaticamente ogni CORE/WATCH con contesto completo in `data/live_v1/forward_registry_v1_2.csv`.
+La v1.3.3 salva automaticamente ogni CORE/WATCH con contesto completo in `data/live_v1/forward_registry_v1_2.csv`.
 
-Per evitare di chiamare *forward* ciò che era già noto prima della v1.3.2.2:
+Per evitare di chiamare *forward* ciò che era già noto prima della v1.3.3:
 - i segnali già presenti al primo avvio vengono marcati **BASELINE**;
 - soltanto i segnali comparsi dopo l'inizializzazione vengono marcati **FORWARD**;
 - quando un segnale raggiunge 5 sedute e dispone di `return_5` ed `excess_5`, l'esito viene **congelato** e non viene riscritto dai successivi refresh Yahoo.
@@ -22,7 +22,7 @@ Il registro conserva anche entry, stato corrente, CORE/WATCH, VALUE, ruolo CEO/C
 1. `Sync / continua SEC Live` fino a Pendenti = 0.
 2. `Costruisci / aggiorna Radar`.
 3. `Aggiorna prezzi / performance`.
-4. La sezione **Forward Registry — v1.3.2** si aggiorna automaticamente.
+4. La sezione **Forward Registry — v1.3.3** si aggiorna automaticamente.
 5. Scarica periodicamente `insider_forward_registry_v1_2.csv` e il backup ZIP.
 
 ## Backup
@@ -30,7 +30,7 @@ Il backup stato live include ora anche:
 - `forward_registry_v1_2.csv`
 - `forward_registry_meta_v1_2.json`
 
-I vecchi backup v1.0/v1.1 restano importabili; se non contengono un registry, il primo avvio v1.3.2.2 crea una nuova BASELINE.
+I vecchi backup v1.0/v1.1 restano importabili; se non contengono un registry, il primo avvio v1.3.3 crea una nuova BASELINE.
 
 ## Deploy Streamlit
 Sostituire insieme:
@@ -55,9 +55,9 @@ Lo stato dati resta nella stessa cartella `data/live_v1`, quindi un deploy sopra
 CORE/WATCH restano classificazioni quantitative del pattern studiato, non raccomandazioni di investimento.
 
 
-## Novità v1.3.2.2 — gerarchia visiva
+## Novità v1.3.3 — gerarchia visiva
 
-La v1.3.2.2 non cambia l'algoritmo. Migliora solo la leggibilità operativa:
+La v1.3.3 non cambia l'algoritmo. Migliora solo la leggibilità operativa:
 
 - guida **Uso quotidiano** nella sidebar;
 - promemoria del flusso in alto: Sync → Radar → Prezzi → CORE;
@@ -74,8 +74,16 @@ Interpretazione: CORE (≥3 insider) è la priorità di monitoraggio; WATCH (2 i
 - La sezione **Dettaglio Radar** contiene NUOVI / ATTIVI / COMPLETATI / anomalie e serve a spiegare lo stato dei segnali, non a creare una seconda priorità.
 
 
-## v1.3.2
+## v1.3.3
 Nella tabella **DA GUARDARE OGGI** sono state aggiunte due colonne informative, senza modificare il segnale:
 - **P/L da Entry %**: rendimento dall'OPEN della prima seduta successiva al filing SEC all'ultimo close disponibile.
 - **Vs SPY %**: excess return rispetto a SPY sullo stesso intervallo.
 Per i segnali 0/5 le colonne restano vuote finché non esiste una seduta di ingresso.
+
+
+## Novità v1.3.3 — tabella operativa semplificata
+
+La vista quotidiana mostra **solo P/L titolo %** nella lista `DA GUARDARE OGGI` e nel Dettaglio Radar.
+Il benchmark SPY e l'excess return continuano a essere calcolati dal motore e restano disponibili nel **Forward Registry** per la verifica statistica, ma non compaiono nella tabella operativa quotidiana.
+
+La definizione di P/L titolo resta invariata: rendimento dall'**OPEN della prima seduta successiva al filing SEC** all'ultimo close disponibile.
