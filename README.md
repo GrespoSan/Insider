@@ -1,50 +1,50 @@
-# Independent Insider Radar — v0.13
+# Independent Insider Radar v0.14 — Value Normalization Audit
 
-La v0.13 aggiunge un **Robustness Audit** alla replica storica 2006–2021. Le regole A/B/C restano congelate: questa versione non ricerca nuove soglie e non ottimizza il segnale.
+Questa versione **non modifica il CORE signal** e non cerca una nuova soglia ottimale.
+Aggiunge un controllo economico sulla fascia di controvalore `$100k–250k`.
 
 ## Regole congelate
 
-- A — FIRST_CLUSTER ≥2 insider
-- B — FIRST_CLUSTER ≥3 insider
-- C — FIRST_CLUSTER ≥3 insider + controvalore aggregato $100k–250k
-- finestra SEC originale ±10 giorni
-- nuovo episodio dopo 10 giorni
-- componente minimo $10.000
-- Officer/Director
-- esclusione 10b5-1 quando marcato
-- ingresso OPEN prima seduta successiva al filing
-- guardia entry entro 7 giorni
-- benchmark SPY
-- orizzonti 1 e 5 sedute
+- **B / CORE**: `FIRST_CLUSTER >= 3 insider`
+- **C-NOMINAL**: B + controvalore nominale del cluster tra `$100k` e `$250k`
+- **C-REAL**: B + controvalore del cluster equivalente a `$100k–250k` in **dollari 2026**
+- Orizzonti analizzati: **1 e 5 sedute**
+- Nuovo episodio: **10 giorni**
 
-## Nuovo: Robustness Audit v0.13
+## Correzione per inflazione
 
-Può usare direttamente `insider_event_study_2006_2021.csv`, senza rifare H1/H2/H3.
+Usiamo CPI-U, U.S. city average, All items, non destagionalizzato.
 
-Controlli inclusi:
+- 2006–2025: **media annuale CPI-U**
+- riferimento 2026: **indice CPI-U agosto 2026 = 334.980**, ultimo dato disponibile quando è stata costruita la v0.14
 
-1. **Copertura Yahoo e missing-data bias** per anno e configurazione.
-2. **Break-even dei dati mancanti**: rendimento medio ipotetico degli eventi non prezzati necessario ad azzerare la media osservata del campione selezionato.
-3. **Stabilità annuale** 2006–2021 con flag automatico per micro-campioni (<30 eventi prezzati o <20 issuer).
-4. **Stress years predefiniti**: 2008 e 2020, più campione esclusi 2008/2020.
-5. **Outlier audit**: media, trimmed 1%, winsorized 1%, mediana, p01/p99, estremi, media senza top 1% winner e quota dei profitti positivi attribuibile al top 1%.
-6. **C vs B-restante**: confronto corretto tra gruppi mutuamente esclusivi, con bootstrap issuer-level. C non viene confrontata contro B completo perché C è un sottoinsieme di B.
+Formula:
 
-Output: `insider_robustness_audit_v0_13.csv`.
+`cluster_value_2026 = cluster_value_nominale * CPI_2026 / CPI_anno`
 
-## Workflow consigliato
+La fascia C-REAL include i cluster con `cluster_value_2026 >= 100000` e `< 250000`.
+Non viene cercata nessuna fascia alternativa.
 
-Se hai già completato la v0.12.1:
+Fonti BLS utilizzate per la tabella statica CPI:
+- Historical CPI-U tables, U.S. Bureau of Labor Statistics
+- CPI-U August 2026 release, U.S. Bureau of Labor Statistics
 
-```text
-Carica insider_event_study_2006_2021.csv
-→ Usa Event Study per Robustness Audit
-→ leggi le sezioni 1–5
-→ scarica insider_robustness_audit_v0_13.csv
-```
+## Come usarla
 
-Non è necessario ripetere Yahoo.
+Per il controllo completo caricare nella sezione **Value Normalization Audit — v0.14**:
 
-## Nota metodologica
+1. `insider_event_study_2006_2021.csv`
+2. `insider_event_study_first_cluster.csv` oppure l'Event Study completo 2022–2026
 
-La v0.13 è un audit, non una nuova fase di ottimizzazione. Se una regola congelata fallisce un controllo, il risultato va registrato come limite; non si deve scegliere una nuova soglia osservando il 2006–2021.
+L'app mostra:
+
+- soglie nominali equivalenti anno per anno;
+- B vs C-NOMINAL vs C-REAL;
+- overlap tra C-NOMINAL e C-REAL;
+- bootstrap issuer-level di ciascuna fascia contro il resto di B;
+- coerenza di media, trimmed mean, mediana e win rate;
+- export `insider_value_normalization_audit_v0_14.csv`.
+
+## Interpretazione corretta
+
+C-REAL serve a verificare se il controvalore aggiunge informazione economica dopo aver tolto l'effetto dell'inflazione. Se non mostra un vantaggio stabile rispetto al CORE B, il filtro monetario non va reso obbligatorio nel radar operativo.

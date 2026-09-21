@@ -277,3 +277,33 @@ def test_checkpoint_signature_rejects_different_signals(tmp_path):
             engine.backtest_signals_checkpointed(sig2, cp, horizons=(1,5))
     finally:
         engine._download_yahoo_prices = original
+
+
+def test_value_in_2026_dollars_increases_old_nominal_value():
+    import engine
+    x = engine.value_in_2026_dollars(100_000, 2006)
+    assert x > 150_000
+    assert abs(engine.value_in_2026_dollars(100_000, 2026) - 100_000) < 1e-9
+
+
+def test_real_band_thresholds_are_lower_in_2006_than_2026():
+    import engine
+    t = engine.real_band_nominal_thresholds_2026(years=[2006, 2026]).set_index("year")
+    assert t.loc[2006, "nominal_lower_equiv"] < 100_000
+    assert t.loc[2006, "nominal_upper_equiv"] < 250_000
+    assert abs(t.loc[2026, "nominal_lower_equiv"] - 100_000) < 1e-9
+
+
+def test_value_normalization_reclassifies_historical_cluster():
+    import engine
+    df = pd.DataFrame([{
+        "issuer_cik":"1","signal_date":"2006-01-10","cluster":True,"n_insiders":3,
+        "cluster_value":80_000,"value_review":False,"excess_1":0.01,"excess_5":0.02,
+    }])
+    enriched, summary, overlap = engine.value_normalization_audit(
+        df, period_label="test", start_date="2006-01-01", end_date="2006-12-31"
+    )
+    row = enriched.iloc[0]
+    assert bool(row["value_band_nominal_100_250"]) is False
+    assert bool(row["value_band_real_2026_100_250"]) is True
+    assert int(overlap.iloc[0]["real_only"]) == 1

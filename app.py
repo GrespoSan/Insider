@@ -737,7 +737,7 @@ def backtest_signals_checkpointed_local(
     return event, _event_summary_checkpoint_local(event, horizons)
 
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.13")
+st.title("Independent Insider Radar — v0.14")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -1866,7 +1866,7 @@ def _audit_all_price_status_by_year(event: pd.DataFrame) -> pd.DataFrame:
 
 
 st.divider()
-st.header("Robustness Audit — v0.13")
+st.header("Robustness Audit — v0.13 (conservato)")
 st.caption(
     "Nessun nuovo filtro e nessun retuning. Questa sezione verifica le regole A/B/C già congelate: "
     "stabilità annuale, anni di stress 2008/2020, dipendenza dagli outlier, valore incrementale della fascia $100k–250k "
@@ -1999,3 +1999,178 @@ if isinstance(robust_event, pd.DataFrame) and not robust_event.empty:
         )
 else:
     st.info("Per il Robustness Audit carica il CSV completo insider_event_study_2006_2021.csv oppure completa/carica H3-H4 sopra.")
+
+# --- v0.14: Value Normalization Audit --------------------------------------
+st.divider()
+st.header("Value Normalization Audit — v0.14")
+st.caption(
+    "Controllo dell'osservazione economica: $100k–250k nominali nel 2006 non hanno lo stesso peso di $100k–250k nel 2026. "
+    "La regola CORE B (FIRST_CLUSTER ≥3 insider) resta congelata. Confrontiamo soltanto C-NOMINAL con C-REAL corretto per CPI-U."
+)
+st.warning(
+    "Nessuna ottimizzazione della fascia: C-REAL è definita meccanicamente come $100k–250k espressi in dollari 2026. "
+    "Per il 2006–2025 usiamo il CPI-U annuale medio; il riferimento 2026 è l'indice CPI-U di agosto 2026 (334.980), ultimo disponibile alla costruzione della v0.14."
+)
+
+# CPI-equivalent thresholds are deterministic and visible before looking at returns.
+thresholds_v014 = engine_mod.real_band_nominal_thresholds_2026()
+tshow = thresholds_v014.copy()
+tshow["nominal_lower_equiv"] = tshow["nominal_lower_equiv"].round(0)
+tshow["nominal_upper_equiv"] = tshow["nominal_upper_equiv"].round(0)
+tshow["inflation_factor_to_2026"] = tshow["inflation_factor_to_2026"].round(3)
+st.subheader("Fascia nominale equivalente a $100k–250k in dollari 2026")
+st.dataframe(tshow, use_container_width=True, hide_index=True)
+st.caption(
+    "Esempio: nel 2006 la fascia reale equivalente è molto più bassa in dollari nominali di allora; nel 2025 è già vicina alla fascia 2026. "
+    "Questo elimina il vantaggio artificiale che una soglia nominale fissa può dare ai primi anni del campione."
+)
+
+u1, u2 = st.columns(2)
+with u1:
+    hist_norm_upload = st.file_uploader(
+        "Storico: insider_event_study_2006_2021.csv",
+        type=["csv"], key="value_norm_hist_upload_v014"
+    )
+    if hist_norm_upload is not None and st.button("Usa storico per Value Audit", key="use_value_norm_hist_v014", use_container_width=True):
+        try:
+            z = engine_mod.normalize_loaded_event_study(pd.read_csv(hist_norm_upload, low_memory=False))
+            st.session_state["value_norm_hist_v014"] = z
+            st.success(f"Storico caricato: {len(z):,} righe.")
+        except Exception as exc:
+            st.error(f"Storico non compatibile: {exc}")
+with u2:
+    recent_norm_upload = st.file_uploader(
+        "Recente: insider_event_study_first_cluster.csv o insider_event_study.csv (2022–2026)",
+        type=["csv"], key="value_norm_recent_upload_v014"
+    )
+    if recent_norm_upload is not None and st.button("Usa recente per Value Audit", key="use_value_norm_recent_v014", use_container_width=True):
+        try:
+            z = engine_mod.normalize_loaded_event_study(pd.read_csv(recent_norm_upload, low_memory=False))
+            st.session_state["value_norm_recent_v014"] = z
+            st.success(f"Periodo recente caricato: {len(z):,} righe.")
+        except Exception as exc:
+            st.error(f"CSV recente non compatibile: {exc}")
+
+# Reuse already-loaded data when available.
+if "value_norm_hist_v014" not in st.session_state:
+    if isinstance(st.session_state.get("robust_event_v013"), pd.DataFrame) and not st.session_state["robust_event_v013"].empty:
+        st.session_state["value_norm_hist_v014"] = st.session_state["robust_event_v013"]
+    elif isinstance(st.session_state.get("hist_event_v012"), pd.DataFrame) and not st.session_state["hist_event_v012"].empty:
+        st.session_state["value_norm_hist_v014"] = st.session_state["hist_event_v012"]
+if "value_norm_recent_v014" not in st.session_state:
+    cur = st.session_state.get("event")
+    if isinstance(cur, pd.DataFrame) and not cur.empty:
+        dd = pd.to_datetime(cur.get("signal_date"), errors="coerce")
+        if dd.notna().any() and dd.max() >= pd.Timestamp("2022-01-01"):
+            st.session_state["value_norm_recent_v014"] = cur
+
+hist_norm_event = st.session_state.get("value_norm_hist_v014")
+recent_norm_event = st.session_state.get("value_norm_recent_v014")
+
+value_audit_parts = []
+summary_frames = []
+overlap_frames = []
+bootstrap_frames = []
+
+if isinstance(hist_norm_event, pd.DataFrame) and not hist_norm_event.empty:
+    bh, sh, oh = engine_mod.value_normalization_audit(
+        hist_norm_event,
+        period_label="2006–2021",
+        start_date="2006-01-01", end_date="2021-12-31",
+        episode_gap_days=10, horizons=(1,5),
+    )
+    summary_frames.append(sh); overlap_frames.append(oh)
+    for col, label in [
+        ("value_band_nominal_100_250", "C-NOMINAL vs resto B"),
+        ("value_band_real_2026_100_250", "C-REAL vs resto B"),
+    ]:
+        bt = engine_mod.value_band_incremental_bootstrap(bh, band_col=col, label=label, horizons=(1,5), n_boot=2000, seed=1414)
+        if not bt.empty:
+            bt.insert(0, "period", "2006–2021"); bootstrap_frames.append(bt)
+    q=bh[[c for c in ["issuer_cik","ticker","signal_date","cluster_value","cluster_value_2026","value_band_nominal_100_250","value_band_real_2026_100_250","excess_1","excess_5"] if c in bh.columns]].copy()
+    q.insert(0,"period","2006–2021"); value_audit_parts.append(q)
+
+if isinstance(recent_norm_event, pd.DataFrame) and not recent_norm_event.empty:
+    br, sr, orr = engine_mod.value_normalization_audit(
+        recent_norm_event,
+        period_label="2022–2026",
+        start_date="2022-01-01", end_date="2026-12-31",
+        episode_gap_days=10, horizons=(1,5),
+    )
+    summary_frames.append(sr); overlap_frames.append(orr)
+    for col, label in [
+        ("value_band_nominal_100_250", "C-NOMINAL vs resto B"),
+        ("value_band_real_2026_100_250", "C-REAL vs resto B"),
+    ]:
+        bt = engine_mod.value_band_incremental_bootstrap(br, band_col=col, label=label, horizons=(1,5), n_boot=2000, seed=1415)
+        if not bt.empty:
+            bt.insert(0, "period", "2022–2026"); bootstrap_frames.append(bt)
+    q=br[[c for c in ["issuer_cik","ticker","signal_date","cluster_value","cluster_value_2026","value_band_nominal_100_250","value_band_real_2026_100_250","excess_1","excess_5"] if c in br.columns]].copy()
+    q.insert(0,"period","2022–2026"); value_audit_parts.append(q)
+
+if summary_frames:
+    vsummary = pd.concat(summary_frames, ignore_index=True)
+    st.subheader("B vs C-NOMINAL vs C-REAL")
+    vs = vsummary.copy()
+    for c in ["mean_excess","trimmed_mean_excess_1pct","median_excess","win_rate_excess"]:
+        if c in vs: vs[c]=(vs[c]*100).round(2)
+    vs=vs.rename(columns={
+        "mean_excess":"mean_excess_%",
+        "trimmed_mean_excess_1pct":"trimmed_mean_1pct_%",
+        "median_excess":"median_excess_%",
+        "win_rate_excess":"win_rate_%",
+    })
+    st.dataframe(vs, use_container_width=True, hide_index=True)
+
+    if overlap_frames:
+        st.subheader("Quanto cambia realmente il campione?")
+        ov=pd.concat(overlap_frames,ignore_index=True)
+        st.dataframe(ov,use_container_width=True,hide_index=True)
+        st.caption(
+            "real_only = eventi esclusi dalla vecchia fascia nominale ma inclusi dopo la correzione CPI; nominal_only = eventi che la soglia nominale includeva ma che non equivalgono a $100k–250k del 2026."
+        )
+
+    if bootstrap_frames:
+        st.subheader("Valore incrementale della fascia rispetto al resto di B")
+        vb=pd.concat(bootstrap_frames,ignore_index=True)
+        vbp=vb.copy()
+        for c in ["observed_diff_vs_B_rest","ci95_low","ci95_high"]:
+            if c in vbp: vbp[c]=(vbp[c]*100).round(2)
+        vbp=vbp.rename(columns={
+            "observed_diff_vs_B_rest":"diff_media_vs_B_rest_%",
+            "ci95_low":"CI95_low_%","ci95_high":"CI95_high_%",
+            "robustly_above_zero":"CI_interamente_>0",
+        })
+        st.dataframe(vbp,use_container_width=True,hide_index=True)
+
+    # Frozen interpretation aid: no auto-selection of a winner, just consistency flags.
+    direction=[]
+    for _,r in vsummary.iterrows():
+        direction.append({
+            "period":r["period"], "rule":r["rule"], "horizon_sessions":int(r["horizon_sessions"]),
+            "mean_>0":bool(r["mean_excess"]>0),
+            "trimmed_>0":bool(r["trimmed_mean_excess_1pct"]>0),
+            "median_>0":bool(r["median_excess"]>0),
+            "win_rate_>50%":bool(r["win_rate_excess"]>0.5),
+        })
+    st.subheader("Coerenza direzionale (nessun ranking)")
+    st.dataframe(pd.DataFrame(direction),use_container_width=True,hide_index=True)
+
+    export_parts=[]
+    x=vsummary.copy(); x.insert(0,"table","summary"); export_parts.append(x)
+    if overlap_frames:
+        x=pd.concat(overlap_frames,ignore_index=True); x.insert(0,"table","overlap"); export_parts.append(x)
+    if bootstrap_frames:
+        x=pd.concat(bootstrap_frames,ignore_index=True); x.insert(0,"table","bootstrap_vs_B_rest"); export_parts.append(x)
+    x=thresholds_v014.copy(); x.insert(0,"table","cpi_thresholds"); export_parts.append(x)
+    audit_export=pd.concat(export_parts,ignore_index=True,sort=False)
+    st.download_button(
+        "Scarica Value Normalization Audit v0.14 CSV",
+        audit_export.to_csv(index=False).encode("utf-8"),
+        file_name="insider_value_normalization_audit_v0_14.csv",
+        mime="text/csv",
+    )
+else:
+    st.info(
+        "Per il Value Normalization Audit carica almeno uno dei due Event Study. Per il confronto completo usa sia 2006–2021 sia 2022–2026."
+    )

@@ -1184,3 +1184,252 @@ def issuer_cluster_bootstrap_difference(
             "robustly_above_zero": bool(np.quantile(b, 0.025) > 0),
         })
     return pd.DataFrame(rows)
+
+# --- v0.14 Value Normalization Audit ---------------------------------------
+# CPI-U, U.S. city average, All items, not seasonally adjusted.
+# 2006-2025 are annual averages (1982-84=100). 2026 uses the latest available
+# August 2026 index as the fixed reference for expressing values in 2026 dollars.
+CPI_U_ANNUAL = {
+    2006: 201.600,
+    2007: 207.342,
+    2008: 215.303,
+    2009: 214.537,
+    2010: 218.056,
+    2011: 224.939,
+    2012: 229.594,
+    2013: 232.957,
+    2014: 236.736,
+    2015: 237.017,
+    2016: 240.007,
+    2017: 245.120,
+    2018: 251.107,
+    2019: 255.657,
+    2020: 258.811,
+    2021: 270.970,
+    2022: 292.655,
+    2023: 304.702,
+    2024: 313.689,
+    2025: 321.943,
+    2026: 334.980,  # Aug 2026, fixed reference; not a full-year average.
+}
+CPI_2026_REFERENCE = CPI_U_ANNUAL[2026]
+
+
+def value_in_2026_dollars(value, year, *, reference_index: float = CPI_2026_REFERENCE):
+    """Convert a nominal USD value in `year` to Aug-2026 CPI-U dollars.
+
+    Uses annual CPI-U averages for 2006-2025 and the Aug-2026 CPI-U index as the
+    fixed reference. Returns NaN for unsupported years or invalid values.
+    """
+    try:
+        v = float(value)
+        y = int(year)
+    except Exception:
+        return np.nan
+    cpi = CPI_U_ANNUAL.get(y)
+    if cpi is None or not np.isfinite(v) or v < 0 or not np.isfinite(reference_index) or reference_index <= 0:
+        return np.nan
+    return float(v * float(reference_index) / float(cpi))
+
+
+def real_band_nominal_thresholds_2026(
+    lower_2026: float = 100_000.0,
+    upper_2026: float = 250_000.0,
+    *,
+    years: Iterable[int] | None = None,
+) -> pd.DataFrame:
+    """Nominal USD thresholds by year equivalent to a fixed 2026-dollar band."""
+    if years is None:
+        years = sorted(CPI_U_ANNUAL)
+    rows = []
+    for y in years:
+        y = int(y)
+        cpi = CPI_U_ANNUAL.get(y)
+        if cpi is None:
+            continue
+        factor = float(cpi) / float(CPI_2026_REFERENCE)
+        rows.append({
+            "year": y,
+            "cpi_u": float(cpi),
+            "nominal_lower_equiv": float(lower_2026 * factor),
+            "nominal_upper_equiv": float(upper_2026 * factor),
+            "inflation_factor_to_2026": float(CPI_2026_REFERENCE / cpi),
+        })
+    return pd.DataFrame(rows)
+
+
+def add_real_value_columns(
+    df: pd.DataFrame,
+    *,
+    value_col: str = "cluster_value",
+    date_col: str = "signal_date",
+    lower_2026: float = 100_000.0,
+    upper_2026: float = 250_000.0,
+) -> pd.DataFrame:
+    """Add nominal-vs-real value-band columns without changing any signal labels."""
+    out = df.copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    out["signal_year"] = out[date_col].dt.year.astype("Int64")
+    out[value_col] = pd.to_numeric(out.get(value_col), errors="coerce")
+    years = out["signal_year"].astype("Int64")
+    cpis = years.map(CPI_U_ANNUAL).astype(float)
+    out["cpi_u_signal_year"] = cpis
+    out["cluster_value_2026"] = out[value_col] * (float(CPI_2026_REFERENCE) / cpis)
+    out["value_band_nominal_100_250"] = out[value_col].ge(lower_2026) & out[value_col].lt(upper_2026)
+    out["value_band_real_2026_100_250"] = out["cluster_value_2026"].ge(lower_2026) & out["cluster_value_2026"].lt(upper_2026)
+    out["cpi_supported"] = cpis.notna()
+    return out
+
+
+def _value_norm_stats(x: pd.Series) -> dict:
+    x = pd.to_numeric(x, errors="coerce").dropna().astype(float)
+    if x.empty:
+        return {"n":0, "mean_excess":np.nan, "trimmed_mean_excess_1pct":np.nan,
+                "median_excess":np.nan, "win_rate_excess":np.nan}
+    lo, hi = x.quantile(0.01), x.quantile(0.99)
+    trim = x[(x >= lo) & (x <= hi)]
+    return {
+        "n": int(len(x)),
+        "mean_excess": float(x.mean()),
+        "trimmed_mean_excess_1pct": float(trim.mean()) if len(trim) else np.nan,
+        "median_excess": float(x.median()),
+        "win_rate_excess": float((x > 0).mean()),
+    }
+
+
+def value_normalization_audit(
+    event: pd.DataFrame,
+    *,
+    period_label: str,
+    start_date: str | pd.Timestamp | None = None,
+    end_date: str | pd.Timestamp | None = None,
+    episode_gap_days: int = 10,
+    horizons: tuple[int, ...] = (1, 5),
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Compare frozen B, nominal C and CPI-normalized C-real.
+
+    Rules are fixed:
+      B: FIRST_CLUSTER >=3 insiders
+      C-NOMINAL: B + nominal cluster value in [$100k, $250k)
+      C-REAL: B + CPI-adjusted 2026-dollar value in [$100k, $250k)
+    Returns enriched B rows, descriptive summary and overlap table.
+    """
+    d = normalize_loaded_event_study(event)
+    d["signal_date"] = pd.to_datetime(d["signal_date"], errors="coerce")
+    if start_date is not None:
+        d = d[d["signal_date"] >= pd.Timestamp(start_date)]
+    if end_date is not None:
+        d = d[d["signal_date"] <= pd.Timestamp(end_date)]
+    labelled = label_cluster_episodes(d, min_insiders=3, episode_gap_days=episode_gap_days)
+    b = labelled[labelled["analysis_group"].eq("FIRST_CLUSTER")].copy()
+    if "value_review" in b.columns:
+        def _bool(v):
+            if isinstance(v, (bool, np.bool_)): return bool(v)
+            if pd.isna(v): return False
+            return str(v).strip().lower() in {"true","1","yes","y","si","sì"}
+        b["value_review"] = b["value_review"].map(_bool)
+    else:
+        b["value_review"] = False
+    b = add_real_value_columns(b)
+
+    masks = {
+        "B · FIRST_CLUSTER ≥3": pd.Series(True, index=b.index),
+        "C-NOMINAL · ≥3 + $100k–250k nominali": b["value_band_nominal_100_250"] & ~b["value_review"],
+        "C-REAL · ≥3 + $100k–250k in $2026": b["value_band_real_2026_100_250"] & ~b["value_review"] & b["cpi_supported"],
+    }
+    rows = []
+    for rule, mask in masks.items():
+        s = b.loc[mask]
+        for h in horizons:
+            col = f"excess_{h}"
+            if col not in s.columns:
+                continue
+            stats = _value_norm_stats(s[col])
+            valid_idx = pd.to_numeric(s[col], errors="coerce").dropna().index
+            rows.append({
+                "period": period_label,
+                "rule": rule,
+                "horizon_sessions": int(h),
+                "selected_events": int(len(s)),
+                "n": stats["n"],
+                "n_issuers": int(s.loc[valid_idx, "issuer_cik"].astype(str).nunique()) if len(valid_idx) else 0,
+                "mean_excess": stats["mean_excess"],
+                "trimmed_mean_excess_1pct": stats["trimmed_mean_excess_1pct"],
+                "median_excess": stats["median_excess"],
+                "win_rate_excess": stats["win_rate_excess"],
+            })
+
+    nom = b["value_band_nominal_100_250"] & ~b["value_review"]
+    real = b["value_band_real_2026_100_250"] & ~b["value_review"] & b["cpi_supported"]
+    overlap = pd.DataFrame([{
+        "period": period_label,
+        "B_events": int(len(b)),
+        "C_nominal_events": int(nom.sum()),
+        "C_real_events": int(real.sum()),
+        "both_nominal_and_real": int((nom & real).sum()),
+        "nominal_only": int((nom & ~real).sum()),
+        "real_only": int((real & ~nom).sum()),
+        "neither": int((~nom & ~real).sum()),
+    }])
+    return b, pd.DataFrame(rows), overlap
+
+
+def value_band_incremental_bootstrap(
+    b_enriched: pd.DataFrame,
+    *,
+    band_col: str,
+    label: str,
+    horizons: tuple[int, ...] = (1, 5),
+    n_boot: int = 2000,
+    seed: int = 1414,
+) -> pd.DataFrame:
+    """Issuer-level bootstrap: selected value band vs the rest of B (mutually exclusive)."""
+    d = b_enriched.copy()
+    if band_col not in d.columns:
+        raise ValueError(f"Colonna {band_col} non presente")
+    mask_a = d[band_col].fillna(False).astype(bool)
+    if "value_review" in d.columns:
+        mask_a &= ~d["value_review"].fillna(False).astype(bool)
+    mask_b = ~mask_a
+    issuers = d["issuer_cik"].fillna("").astype(str).unique()
+    rng = np.random.default_rng(seed)
+    rows=[]
+    for h in horizons:
+        col=f"excess_{h}"
+        if col not in d.columns: continue
+        z=d[["issuer_cik",col]].copy()
+        z["_A"]=mask_a.values; z["_B"]=mask_b.values
+        z[col]=pd.to_numeric(z[col],errors="coerce")
+        z=z.dropna(subset=[col])
+        a=z[z["_A"]]; bb=z[z["_B"]]
+        if a.empty or bb.empty: continue
+        obs=float(a[col].mean()-bb[col].mean())
+        pos={u:i for i,u in enumerate(issuers)}
+        sa=np.zeros(len(issuers)); ca=np.zeros(len(issuers)); sb=np.zeros(len(issuers)); cb=np.zeros(len(issuers))
+        for issuer,g in z.groupby("issuer_cik"):
+            i=pos.get(str(issuer));
+            if i is None: continue
+            ga=g[g["_A"]]; gb=g[g["_B"]]
+            if len(ga): sa[i]=ga[col].sum(); ca[i]=len(ga)
+            if len(gb): sb[i]=gb[col].sum(); cb[i]=len(gb)
+        boots=[]
+        for _ in range(int(n_boot)):
+            samp=rng.integers(0,len(issuers),size=len(issuers))
+            na=ca[samp].sum(); nb=cb[samp].sum()
+            if na<=0 or nb<=0: continue
+            boots.append(sa[samp].sum()/na - sb[samp].sum()/nb)
+        if not boots: continue
+        arr=np.asarray(boots,float)
+        rows.append({
+            "band": label,
+            "horizon_sessions": int(h),
+            "observed_diff_vs_B_rest": obs,
+            "ci95_low": float(np.quantile(arr,0.025)),
+            "ci95_high": float(np.quantile(arr,0.975)),
+            "bootstrap_reps": int(len(arr)),
+            "n_band": int(len(a)),
+            "n_B_rest": int(len(bb)),
+            "n_issuers": int(len(issuers)),
+            "robustly_above_zero": bool(np.quantile(arr,0.025)>0),
+        })
+    return pd.DataFrame(rows)
