@@ -48,7 +48,7 @@ def _sec_headers(contact_email: str) -> dict[str, str]:
     if not email or "@" not in email:
         raise ValueError("Inserisci una email valida per il User-Agent SEC.")
     return {
-        "User-Agent": f"IndependentInsiderRadarLive/1.0 {email}",
+        "User-Agent": f"IndependentInsiderRadarLive/1.1 {email}",
         "Accept-Encoding": "gzip, deflate",
     }
 
@@ -588,6 +588,79 @@ def build_live_radar(
     sig = sig.sort_values(["_rank", "signal_date", "cluster_value"], ascending=[True, False, False])
     return sig.drop(columns=["_rank"]).reset_index(drop=True)
 
+
+
+def add_operational_columns(radar: pd.DataFrame) -> pd.DataFrame:
+    """Add presentation-only operational fields without changing the frozen signal rules.
+
+    Buckets are deliberately mechanical:
+    - NUOVO: no next trading session exists yet (e.g. weekend / same-day filing).
+    - ATTIVO: entry exists and 1-4 sessions have been observed.
+    - COMPLETATO: at least 5 sessions have been observed.
+    - DA PREZZARE: Yahoo enrichment has not been run for the signal.
+    - DA VERIFICARE: ticker/price/history could not be resolved reliably.
+    """
+    if radar is None:
+        return pd.DataFrame()
+    out = radar.copy()
+    if out.empty:
+        return out
+
+    if "price_status" not in out.columns:
+        out["price_status"] = "not_requested"
+    if "sessions_observed" not in out.columns:
+        out["sessions_observed"] = np.nan
+
+    sessions = pd.to_numeric(out["sessions_observed"], errors="coerce")
+    status = out["price_status"].fillna("not_requested").astype(str)
+
+    bucket = pd.Series("DA VERIFICARE", index=out.index, dtype="object")
+    bucket.loc[status.eq("not_requested")] = "DA PREZZARE"
+    bucket.loc[status.eq("no_future_session")] = "NUOVO"
+    bucket.loc[status.eq("ok") & sessions.between(1, 4, inclusive="both")] = "ATTIVO"
+    bucket.loc[status.eq("ok") & sessions.ge(5)] = "COMPLETATO"
+    out["operational_bucket"] = bucket
+
+    def day_label(row) -> str:
+        b = str(row.get("operational_bucket", ""))
+        n = pd.to_numeric(pd.Series([row.get("sessions_observed")]), errors="coerce").iloc[0]
+        if b == "NUOVO":
+            return "0/5"
+        if b in {"ATTIVO", "COMPLETATO"} and pd.notna(n):
+            return f"{min(5, max(0, int(n)))}/5"
+        return "—"
+
+    out["day_5"] = out.apply(day_label, axis=1)
+
+    n_insiders = pd.to_numeric(out.get("n_insiders", pd.Series(index=out.index, dtype=float)), errors="coerce")
+    out["insider_band"] = np.select(
+        [n_insiders.ge(5), n_insiders.eq(4), n_insiders.eq(3), n_insiders.eq(2)],
+        ["5+", "4", "3", "2"],
+        default="—",
+    )
+
+    roles = out.get("roles", pd.Series("", index=out.index)).fillna("").astype(str)
+    def role_tag(text: str) -> str:
+        t = str(text).lower()
+        ceo = bool(re.search(r"\bceo\b|chief executive officer|president\s*[/,&-]?\s*ceo", t))
+        cfo = bool(re.search(r"\bcfo\b|chief financial officer|co\s*cfo", t))
+        if ceo and cfo:
+            return "CEO+CFO"
+        if ceo:
+            return "CEO"
+        if cfo:
+            return "CFO"
+        return "—"
+    out["role_tag"] = roles.map(role_tag)
+
+    # 2026 is the live reference year, so the nominal live value equals the 2026-dollar tag.
+    out["value_flag"] = np.where(out.get("value_tag", pd.Series("", index=out.index)).fillna("").astype(str).ne(""), "VALUE", "")
+
+    rank = {"CORE": 0, "WATCH": 1, "REPEAT_CORE": 2, "REPEAT": 3, "SOLO": 4}
+    out["_priority_rank_v11"] = out.get("priority", pd.Series("", index=out.index)).map(rank).fillna(9)
+    out["signal_date"] = pd.to_datetime(out.get("signal_date"), errors="coerce")
+    out = out.sort_values(["_priority_rank_v11", "signal_date", "cluster_value"], ascending=[True, False, False])
+    return out.drop(columns=["_priority_rank_v11"]).reset_index(drop=True)
 
 def enrich_live_prices(
     radar: pd.DataFrame,

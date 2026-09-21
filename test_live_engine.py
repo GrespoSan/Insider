@@ -1,7 +1,8 @@
 from datetime import date
 import pandas as pd
+import numpy as np
 
-from live_engine import parse_master_index, parse_form4_xml, build_live_radar
+from live_engine import parse_master_index, parse_form4_xml, build_live_radar, add_operational_columns
 
 
 def sample_xml(code="P", acquired="A", is_director="1", is_officer="0", aff="0", owners=1, title="Common Stock", price="10", shares="2000"):
@@ -34,7 +35,12 @@ def sample_xml(code="P", acquired="A", is_director="1", is_officer="0", aff="0",
 
 
 def test_master_index_keeps_only_form4():
-    text = """Header\nCIK|Company Name|Form Type|Date Filed|Filename\n1|A|4|2026-09-10|edgar/data/1/0000000001-26-000001.txt\n2|B|4/A|2026-09-10|edgar/data/2/0000000002-26-000002.txt\n3|C|10-K|2026-09-10|edgar/data/3/0000000003-26-000003.txt\n"""
+    text = """Header
+CIK|Company Name|Form Type|Date Filed|Filename
+1|A|4|2026-09-10|edgar/data/1/0000000001-26-000001.txt
+2|B|4/A|2026-09-10|edgar/data/2/0000000002-26-000002.txt
+3|C|10-K|2026-09-10|edgar/data/3/0000000003-26-000003.txt
+"""
     df = parse_master_index(text, date(2026, 9, 10))
     assert len(df) == 1
     assert df.iloc[0]["accession"] == "0000000001-26-000001"
@@ -72,3 +78,23 @@ def test_build_live_radar_core_first_three():
     assert len(core) == 1
     assert int(core.iloc[0]["n_insiders"]) == 3
     assert core.iloc[0]["value_tag"] == "VALUE 100–250k (2026$)"
+
+
+def test_operational_buckets_and_day_progress():
+    df = pd.DataFrame([
+        {"priority":"CORE","ticker":"A","signal_date":"2026-09-18","n_insiders":3,"cluster_value":120000,"value_tag":"VALUE 100–250k (2026$)","roles":"Chief Executive Officer; Director","price_status":"no_future_session","sessions_observed":np.nan},
+        {"priority":"CORE","ticker":"B","signal_date":"2026-09-17","n_insiders":4,"cluster_value":400000,"value_tag":"","roles":"Chief Financial Officer; Director","price_status":"ok","sessions_observed":2},
+        {"priority":"WATCH","ticker":"C","signal_date":"2026-09-10","n_insiders":2,"cluster_value":60000,"value_tag":"","roles":"Director","price_status":"ok","sessions_observed":6},
+        {"priority":"CORE","ticker":"D","signal_date":"2026-09-10","n_insiders":5,"cluster_value":60000,"value_tag":"","roles":"CEO; CFO","price_status":"missing_price","sessions_observed":np.nan},
+    ])
+    out = add_operational_columns(df)
+    got = dict(zip(out["ticker"], out["operational_bucket"]))
+    assert got == {"A":"NUOVO","B":"ATTIVO","D":"DA VERIFICARE","C":"COMPLETATO"}
+    row_a = out[out["ticker"].eq("A")].iloc[0]
+    row_b = out[out["ticker"].eq("B")].iloc[0]
+    row_c = out[out["ticker"].eq("C")].iloc[0]
+    row_d = out[out["ticker"].eq("D")].iloc[0]
+    assert row_a["day_5"] == "0/5" and row_a["value_flag"] == "VALUE" and row_a["role_tag"] == "CEO"
+    assert row_b["day_5"] == "2/5" and row_b["insider_band"] == "4" and row_b["role_tag"] == "CFO"
+    assert row_c["day_5"] == "5/5"
+    assert row_d["insider_band"] == "5+" and row_d["role_tag"] == "CEO+CFO"
