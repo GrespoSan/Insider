@@ -214,3 +214,66 @@ def test_normalize_loaded_event_study():
     out=normalize_loaded_event_study(raw)
     assert bool(out.iloc[0].cluster) is True
     assert int(out.iloc[0].n_insiders)==2
+
+
+def test_checkpointed_backtest_resumes_without_redownload(tmp_path):
+    import engine
+    sig = pd.DataFrame([
+        {
+            'issuer_cik':'1','ticker':'TST','ticker_status':'ok','issuer_name':'Test',
+            'signal_date':pd.Timestamp('2020-01-02'),'cluster':False,'n_insiders':1,
+            'new_filing_value':10000,'cluster_value':10000,'value_review':False,
+            'window_start':pd.Timestamp('2020-01-02'),'window_end':pd.Timestamp('2020-01-02'),
+            'owners':'Alice','roles':'CEO','mean_filing_lag_days':0.0,'accessions':'A1'
+        }
+    ])
+    idx = pd.to_datetime(['2020-01-03','2020-01-06','2020-01-07','2020-01-08','2020-01-09'])
+    px = pd.DataFrame({'Open':[10,10,10,10,10],'Close':[11,12,13,14,15]}, index=idx)
+    spy = pd.DataFrame({'Open':[100,100,100,100,100],'Close':[101,102,103,104,105]}, index=idx)
+    cp = tmp_path / 'hist.csv'
+    original = engine._download_yahoo_prices
+    calls=[]
+    try:
+        def fake(symbols, start, end, batch_size=80):
+            calls.append(tuple(symbols))
+            out={}
+            for s in symbols:
+                out[s] = spy if s == 'SPY' else px
+            return out
+        engine._download_yahoo_prices = fake
+        ev, sm = engine.backtest_signals_checkpointed(sig, cp, horizons=(1,5), batch_size=40)
+        assert len(ev) == 1 and cp.exists()
+        first_calls=len(calls)
+        def should_not_call(*args, **kwargs):
+            raise AssertionError('resume completo non deve riscaricare Yahoo')
+        engine._download_yahoo_prices = should_not_call
+        ev2, sm2 = engine.backtest_signals_checkpointed(sig, cp, horizons=(1,5), batch_size=40)
+        assert len(ev2) == 1
+        assert first_calls >= 2
+    finally:
+        engine._download_yahoo_prices = original
+
+
+def test_checkpoint_signature_rejects_different_signals(tmp_path):
+    import engine
+    sig = pd.DataFrame([{
+        'issuer_cik':'1','ticker':'','ticker_status':'missing','issuer_name':'Test',
+        'signal_date':pd.Timestamp('2020-01-02'),'cluster':False,'n_insiders':1,
+        'new_filing_value':10000,'cluster_value':10000,'value_review':False,
+        'window_start':pd.Timestamp('2020-01-02'),'window_end':pd.Timestamp('2020-01-02'),
+        'owners':'Alice','roles':'CEO','mean_filing_lag_days':0.0,'accessions':'A1'
+    }])
+    cp = tmp_path / 'hist.csv'
+    # No Yahoo call is needed because ticker is missing, except benchmark in current implementation.
+    original = engine._download_yahoo_prices
+    try:
+        idx = pd.to_datetime(['2020-01-03'])
+        spy = pd.DataFrame({'Open':[100.0],'Close':[101.0]}, index=idx)
+        engine._download_yahoo_prices = lambda symbols, start, end, batch_size=80: {'SPY':spy}
+        engine.backtest_signals_checkpointed(sig, cp, horizons=(1,5))
+        sig2 = sig.copy(); sig2.loc[0,'issuer_cik']='2'
+        import pytest
+        with pytest.raises(ValueError):
+            engine.backtest_signals_checkpointed(sig2, cp, horizons=(1,5))
+    finally:
+        engine._download_yahoo_prices = original

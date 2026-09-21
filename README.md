@@ -1,80 +1,50 @@
-# Independent Insider Radar — v0.12.1
+# Independent Insider Radar — v0.13
 
-Prototipo indipendente basato su SEC Form 4 e prezzi Yahoo Finance. La v0.12.1 aggiunge la **Replica storica indipendente 2006–2021** con regole congelate prima di guardare quel periodo.
+La v0.13 aggiunge un **Robustness Audit** alla replica storica 2006–2021. Le regole A/B/C restano congelate: questa versione non ricerca nuove soglie e non ottimizza il segnale.
 
-## Regole congelate della replica
+## Regole congelate
 
-Fonte e pulizia:
-- SEC Form 4 originali;
-- transazioni non-derivate codice `P`, `A` (acquired);
-- common/ordinary shares;
-- prezzo e quantità positivi;
-- solo Officer/Director;
-- filing marcati 10b5-1 esclusi quando disponibili;
-- valore minimo del singolo componente: **$10.000**;
-- filing con più reporting owner esclusi per evitare attribuzioni ambigue nel dataset piatto SEC;
-- finestra originale delle transazioni: **±10 giorni**;
-- nuovo episodio FIRST_CLUSTER dopo **10 giorni**.
+- A — FIRST_CLUSTER ≥2 insider
+- B — FIRST_CLUSTER ≥3 insider
+- C — FIRST_CLUSTER ≥3 insider + controvalore aggregato $100k–250k
+- finestra SEC originale ±10 giorni
+- nuovo episodio dopo 10 giorni
+- componente minimo $10.000
+- Officer/Director
+- esclusione 10b5-1 quando marcato
+- ingresso OPEN prima seduta successiva al filing
+- guardia entry entro 7 giorni
+- benchmark SPY
+- orizzonti 1 e 5 sedute
 
-Configurazioni pre-dichiarate:
-- **A** — FIRST_CLUSTER con almeno 2 insider;
-- **B** — FIRST_CLUSTER con almeno 3 insider;
-- **C** — FIRST_CLUSTER con almeno 3 insider e controvalore aggregato **$100k–250k**.
+## Nuovo: Robustness Audit v0.13
 
-Backtest:
-- ingresso: OPEN della prima seduta successiva al filing SEC;
-- guardia ticker/storico: entry entro 7 giorni di calendario dal filing;
-- benchmark: SPY;
-- orizzonti congelati: **1 e 5 sedute**;
-- confronto robusto tramite bootstrap a livello issuer.
+Può usare direttamente `insider_event_study_2006_2021.csv`, senza rifare H1/H2/H3.
 
-## Workflow v0.12.1
+Controlli inclusi:
 
-1. Avvia l'app:
+1. **Copertura Yahoo e missing-data bias** per anno e configurazione.
+2. **Break-even dei dati mancanti**: rendimento medio ipotetico degli eventi non prezzati necessario ad azzerare la media osservata del campione selezionato.
+3. **Stabilità annuale** 2006–2021 con flag automatico per micro-campioni (<30 eventi prezzati o <20 issuer).
+4. **Stress years predefiniti**: 2008 e 2020, più campione esclusi 2008/2020.
+5. **Outlier audit**: media, trimmed 1%, winsorized 1%, mediana, p01/p99, estremi, media senza top 1% winner e quota dei profitti positivi attribuibile al top 1%.
+6. **C vs B-restante**: confronto corretto tra gruppi mutuamente esclusivi, con bootstrap issuer-level. C non viene confrontata contro B completo perché C è un sottoinsieme di B.
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
+Output: `insider_robustness_audit_v0_13.csv`.
+
+## Workflow consigliato
+
+Se hai già completato la v0.12.1:
+
+```text
+Carica insider_event_study_2006_2021.csv
+→ Usa Event Study per Robustness Audit
+→ leggi le sezioni 1–5
+→ scarica insider_robustness_audit_v0_13.csv
 ```
 
-2. Nella sezione **Replica storica indipendente 2006–2021**:
-   - `H1` scarica/aggiorna i 64 trimestri SEC 2006Q1–2021Q4;
-   - `H2` costruisce i componenti e i segnali storici con le regole congelate;
-   - `H3` esegue il backtest Yahoo 1/5 sedute con **checkpoint persistente per batch**;
-   - `H4` carica il checkpoint completato e applica le tre configurazioni senza retuning.
+Non è necessario ripetere Yahoo.
 
-## Checkpoint
+## Nota metodologica
 
-La v0.12.1 salva automaticamente ogni batch Yahoo in:
-
-`data/historical_replication_v0_12/insider_event_study_2006_2021.csv`
-
-Se Streamlit si riavvia durante il test, `H3` riprende dagli eventi non ancora elaborati. Una firma del set di segnali impedisce di riutilizzare per errore un checkpoint appartenente a dati/regole differenti.
-
-Anche i componenti SEC vengono salvati trimestre per trimestre in modo che `H2` possa riutilizzare quelli già elaborati.
-
-## Output diagnostici
-
-La replica mostra:
-- copertura Yahoo per anno;
-- numerosità e copertura per configurazione;
-- media, trimmed mean 1%, mediana e win rate;
-- bootstrap issuer-level configurazione − SOLO;
-- diagnostica temporale fissa 2006–2010 / 2011–2015 / 2016–2021;
-- criteri pre-dichiarati di direzione e robustezza.
-
-## Limite importante
-
-Yahoo può non conservare prezzi storici per molti ticker delistati o riutilizzati. La copertura prezzi è quindi parte integrante dell'interpretazione: una replica positiva con copertura bassa non costituisce da sola una validazione definitiva.
-
-## Test
-
-```bash
-pytest -q
-```
-
-La v0.12.1 include test per causalità dei cluster, ticker mancanti, timezone, guardia anti-storico incoerente, caricamento CSV e ripresa/checkpoint del backtest storico.
-
-
-## Fix v0.12.1
-H3 non dipende più dalla presenza di `backtest_signals_checkpointed` nel modulo `engine.py`: `app.py` contiene un fallback locale deployment-safe che usa gli helper Yahoo già presenti nelle versioni v0.8–v0.11. Questo evita il falso blocco “engine.py non è aggiornato” dovuto a deploy/cache disallineati su Streamlit Cloud.
+La v0.13 è un audit, non una nuova fase di ottimizzazione. Se una regola congelata fallisce un controllo, il risultato va registrato come limite; non si deve scegliere una nuova soglia osservando il 2006–2021.

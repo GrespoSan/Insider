@@ -737,7 +737,7 @@ def backtest_signals_checkpointed_local(
     return event, _event_summary_checkpoint_local(event, horizons)
 
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.12.1")
+st.title("Independent Insider Radar — v0.13")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -1303,7 +1303,7 @@ if isinstance(event_adv, pd.DataFrame) and not event_adv.empty:
 
 # --- Historical Replication 2006-2021 (frozen rules) ---
 st.divider()
-st.header("Replica storica indipendente 2006–2021 — v0.12.1")
+st.header("Replica storica indipendente 2006–2021 — v0.13")
 st.info(
     "Test realmente separato dal periodo 2022–2026 usato per esplorare le regole. "
     "Le configurazioni sono congelate: A = FIRST_CLUSTER ≥2; B = FIRST_CLUSTER ≥3; "
@@ -1584,3 +1584,418 @@ if isinstance(hist_event, pd.DataFrame) and not hist_event.empty:
             "Limite strutturale: Yahoo può non avere prezzi per molti ticker delistati/storici. La tabella di copertura è parte integrante del risultato: "
             "una replica positiva con copertura molto bassa non va interpretata come prova definitiva."
         )
+
+
+# --- v0.13: Robustness Audit of the frozen historical replication ---
+ROBUST_AUDIT_CONFIGS = [
+    ("A · FIRST_CLUSTER ≥2 insider", 2, None),
+    ("B · FIRST_CLUSTER ≥3 insider", 3, None),
+    ("C · ≥3 insider + $100k–250k", 3, "$100k–250k"),
+]
+
+
+def _audit_selected_sets(event: pd.DataFrame, episode_gap_days: int = 10) -> dict[str, pd.DataFrame]:
+    d = normalize_loaded_event_study(event)
+    d = d[pd.to_datetime(d["signal_date"], errors="coerce").between(HIST_START, HIST_END, inclusive="both")].copy()
+    out = {}
+    for name, thr, bucket in ROBUST_AUDIT_CONFIGS:
+        labelled = label_cluster_episodes(d, min_insiders=thr, episode_gap_days=episode_gap_days)
+        enriched = enrich_first_cluster_features(labelled)
+        mask = enriched["analysis_group"].eq("FIRST_CLUSTER")
+        if bucket is not None:
+            mask &= enriched["value_bucket"].astype(str).eq(bucket) & ~enriched["value_review"]
+        out[name] = enriched.loc[mask].copy()
+    return out
+
+
+def _audit_robust_stats(x: pd.Series) -> dict:
+    x = pd.to_numeric(x, errors="coerce").dropna().astype(float)
+    if x.empty:
+        return {
+            "n": 0, "mean_excess": np.nan, "trimmed_mean_1pct": np.nan,
+            "winsorized_mean_1pct": np.nan, "median_excess": np.nan,
+            "win_rate": np.nan, "p01": np.nan, "p99": np.nan,
+            "min": np.nan, "max": np.nan, "mean_without_top1pct_winners": np.nan,
+            "top1pct_share_of_positive_sum": np.nan,
+        }
+    p01, p99 = x.quantile(0.01), x.quantile(0.99)
+    trimmed = x[(x >= p01) & (x <= p99)]
+    wins = x.clip(lower=p01, upper=p99)
+    no_top_winners = x[x <= p99]
+    positive_sum = x[x > 0].sum()
+    top_pos_sum = x[x > p99].clip(lower=0).sum()
+    return {
+        "n": int(len(x)),
+        "mean_excess": float(x.mean()),
+        "trimmed_mean_1pct": float(trimmed.mean()) if len(trimmed) else np.nan,
+        "winsorized_mean_1pct": float(wins.mean()),
+        "median_excess": float(x.median()),
+        "win_rate": float((x > 0).mean()),
+        "p01": float(p01),
+        "p99": float(p99),
+        "min": float(x.min()),
+        "max": float(x.max()),
+        "mean_without_top1pct_winners": float(no_top_winners.mean()) if len(no_top_winners) else np.nan,
+        "top1pct_share_of_positive_sum": float(top_pos_sum / positive_sum) if positive_sum > 0 else np.nan,
+    }
+
+
+def _audit_yearly_tables(selected_sets: dict[str, pd.DataFrame], horizons=(1, 5)) -> pd.DataFrame:
+    rows = []
+    for config, s0 in selected_sets.items():
+        s = s0.copy()
+        s["signal_date"] = pd.to_datetime(s["signal_date"], errors="coerce")
+        s["year"] = s["signal_date"].dt.year
+        for year, g in s.groupby("year"):
+            for h in horizons:
+                col = f"excess_{h}"
+                x = pd.to_numeric(g.get(col), errors="coerce").dropna()
+                stats = _audit_robust_stats(x)
+                priced_issuers = int(g.loc[x.index, "issuer_cik"].astype(str).nunique()) if len(x) else 0
+                rows.append({
+                    "config": config,
+                    "year": int(year),
+                    "horizon_sessions": int(h),
+                    "selected_events": int(len(g)),
+                    "selected_issuers": int(g["issuer_cik"].astype(str).nunique()),
+                    "priced_events": int(len(x)),
+                    "priced_issuers": priced_issuers,
+                    "coverage_%": float(100 * len(x) / len(g)) if len(g) else np.nan,
+                    "mean_excess": stats["mean_excess"],
+                    "trimmed_mean_1pct": stats["trimmed_mean_1pct"],
+                    "median_excess": stats["median_excess"],
+                    "win_rate": stats["win_rate"],
+                    "small_sample_flag": bool(len(x) < 30 or priced_issuers < 20),
+                })
+    return pd.DataFrame(rows)
+
+
+def _audit_stress_periods(selected_sets: dict[str, pd.DataFrame], horizons=(1, 5)) -> pd.DataFrame:
+    periods = [
+        ("2008", pd.Timestamp("2008-01-01"), pd.Timestamp("2008-12-31")),
+        ("2020", pd.Timestamp("2020-01-01"), pd.Timestamp("2020-12-31")),
+        ("Esclusi 2008 e 2020", HIST_START, HIST_END),
+    ]
+    rows = []
+    for config, s0 in selected_sets.items():
+        s = s0.copy()
+        s["signal_date"] = pd.to_datetime(s["signal_date"], errors="coerce")
+        for pname, lo, hi in periods:
+            if pname == "Esclusi 2008 e 2020":
+                g = s[~s["signal_date"].dt.year.isin([2008, 2020])]
+            else:
+                g = s[s["signal_date"].between(lo, hi, inclusive="both")]
+            for h in horizons:
+                x = pd.to_numeric(g.get(f"excess_{h}"), errors="coerce").dropna()
+                stt = _audit_robust_stats(x)
+                rows.append({
+                    "config": config,
+                    "period": pname,
+                    "horizon_sessions": int(h),
+                    "n": stt["n"],
+                    "n_issuers": int(g.loc[x.index, "issuer_cik"].astype(str).nunique()) if len(x) else 0,
+                    "mean_excess": stt["mean_excess"],
+                    "trimmed_mean_1pct": stt["trimmed_mean_1pct"],
+                    "median_excess": stt["median_excess"],
+                    "win_rate": stt["win_rate"],
+                })
+    return pd.DataFrame(rows)
+
+
+def _audit_outliers(selected_sets: dict[str, pd.DataFrame], horizons=(1, 5)) -> pd.DataFrame:
+    rows = []
+    for config, s in selected_sets.items():
+        for h in horizons:
+            stats = _audit_robust_stats(s.get(f"excess_{h}", pd.Series(dtype=float)))
+            rows.append({"config": config, "horizon_sessions": int(h), **stats})
+    return pd.DataFrame(rows)
+
+
+def _audit_missing_data(selected_sets: dict[str, pd.DataFrame], horizons=(1, 5)) -> pd.DataFrame:
+    rows = []
+    for config, s in selected_sets.items():
+        for h in horizons:
+            col = f"excess_{h}"
+            x = pd.to_numeric(s.get(col), errors="coerce")
+            priced = x.notna()
+            n_priced = int(priced.sum())
+            n_missing = int((~priced).sum())
+            observed_sum = float(x[priced].sum()) if n_priced else 0.0
+            break_even_missing = (-observed_sum / n_missing) if n_missing else np.nan
+            ps = s.get("price_status", pd.Series("", index=s.index)).fillna("").astype(str)
+            rows.append({
+                "config": config,
+                "horizon_sessions": int(h),
+                "selected_events": int(len(s)),
+                "priced_events": n_priced,
+                "missing_events": n_missing,
+                "coverage_%": float(100 * n_priced / len(s)) if len(s) else np.nan,
+                "observed_mean_excess": float(x[priced].mean()) if n_priced else np.nan,
+                "break_even_missing_avg_excess_to_zero": break_even_missing,
+                "missing_price": int(((~priced) & ps.eq("missing_price")).sum()),
+                "missing_ticker": int(((~priced) & ps.eq("missing_ticker")).sum()),
+                "stale_symbol_or_gap": int(((~priced) & ps.eq("stale_symbol_or_gap")).sum()),
+                "other_missing": int(((~priced) & ~ps.isin(["missing_price", "missing_ticker", "stale_symbol_or_gap"])).sum()),
+            })
+    return pd.DataFrame(rows)
+
+
+def _audit_bootstrap_two_masks(
+    df: pd.DataFrame,
+    mask_a: pd.Series,
+    mask_b: pd.Series,
+    *,
+    group_a: str,
+    group_b: str,
+    horizons=(1, 5),
+    n_boot: int = 2000,
+    seed: int = 1300,
+) -> pd.DataFrame:
+    rows = []
+    base = df.copy()
+    base["issuer_cik"] = base["issuer_cik"].fillna("").astype(str)
+    ma = pd.Series(mask_a, index=base.index).fillna(False).astype(bool)
+    mb = pd.Series(mask_b, index=base.index).fillna(False).astype(bool)
+    issuer_ids = base.loc[ma | mb, "issuer_cik"].dropna().astype(str).unique()
+    if len(issuer_ids) == 0:
+        return pd.DataFrame()
+    issuer_pos = {u: i for i, u in enumerate(issuer_ids)}
+    rng = np.random.default_rng(seed)
+    for h in horizons:
+        col = f"excess_{h}"
+        if col not in base.columns:
+            continue
+        vals = pd.to_numeric(base[col], errors="coerce")
+        va = ma & vals.notna()
+        vb = mb & vals.notna()
+        if not va.any() or not vb.any():
+            continue
+        sums_a = np.zeros(len(issuer_ids)); counts_a = np.zeros(len(issuer_ids))
+        sums_b = np.zeros(len(issuer_ids)); counts_b = np.zeros(len(issuer_ids))
+        tmp = pd.DataFrame({"issuer_cik": base["issuer_cik"], "v": vals, "a": va, "b": vb})
+        for issuer, g in tmp[(tmp["a"] | tmp["b"])].groupby("issuer_cik"):
+            i = issuer_pos.get(str(issuer))
+            if i is None:
+                continue
+            xa = g.loc[g["a"], "v"].dropna().to_numpy(dtype=float)
+            xb = g.loc[g["b"], "v"].dropna().to_numpy(dtype=float)
+            if xa.size:
+                sums_a[i] = xa.sum(); counts_a[i] = xa.size
+            if xb.size:
+                sums_b[i] = xb.sum(); counts_b[i] = xb.size
+        observed = float(vals[va].mean() - vals[vb].mean())
+        boots = []
+        for _ in range(int(n_boot)):
+            sample = rng.integers(0, len(issuer_ids), size=len(issuer_ids))
+            ca = counts_a[sample].sum(); cb = counts_b[sample].sum()
+            if ca <= 0 or cb <= 0:
+                continue
+            boots.append((sums_a[sample].sum() / ca) - (sums_b[sample].sum() / cb))
+        if not boots:
+            continue
+        b = np.asarray(boots, dtype=float)
+        lo, hi = np.quantile(b, [0.025, 0.975])
+        rows.append({
+            "comparison": f"{group_a} − {group_b}",
+            "horizon_sessions": int(h),
+            "n_a": int(va.sum()),
+            "n_b": int(vb.sum()),
+            "observed_diff": observed,
+            "ci95_low": float(lo),
+            "ci95_high": float(hi),
+            "bootstrap_reps": int(len(b)),
+            "n_issuers": int(len(issuer_ids)),
+            "CI_interamente_>0": bool(lo > 0),
+        })
+    return pd.DataFrame(rows)
+
+
+def _audit_c_vs_b_other(event: pd.DataFrame, episode_gap_days: int = 10) -> tuple[pd.DataFrame, pd.DataFrame]:
+    d = normalize_loaded_event_study(event)
+    d = d[pd.to_datetime(d["signal_date"], errors="coerce").between(HIST_START, HIST_END, inclusive="both")].copy()
+    labelled = label_cluster_episodes(d, min_insiders=3, episode_gap_days=episode_gap_days)
+    enriched = enrich_first_cluster_features(labelled)
+    bmask = enriched["analysis_group"].eq("FIRST_CLUSTER")
+    cmask = bmask & enriched["value_bucket"].astype(str).eq("$100k–250k") & ~enriched["value_review"]
+    bother = bmask & ~cmask
+    desc = []
+    for group_name, mask in [("C · $100k–250k", cmask), ("B restante · ≥3 fuori fascia C", bother)]:
+        s = enriched.loc[mask]
+        for h in (1, 5):
+            stats = _audit_robust_stats(s.get(f"excess_{h}", pd.Series(dtype=float)))
+            desc.append({
+                "group": group_name,
+                "horizon_sessions": h,
+                "selected_events": int(len(s)),
+                "n": stats["n"],
+                "n_issuers": int(s.loc[pd.to_numeric(s.get(f"excess_{h}"), errors="coerce").notna(), "issuer_cik"].astype(str).nunique()) if f"excess_{h}" in s else 0,
+                "mean_excess": stats["mean_excess"],
+                "trimmed_mean_1pct": stats["trimmed_mean_1pct"],
+                "median_excess": stats["median_excess"],
+                "win_rate": stats["win_rate"],
+            })
+    boot = _audit_bootstrap_two_masks(
+        enriched, cmask, bother,
+        group_a="C $100k–250k", group_b="B restante",
+        horizons=(1, 5), n_boot=2000, seed=1313,
+    )
+    return pd.DataFrame(desc), boot
+
+
+def _audit_all_price_status_by_year(event: pd.DataFrame) -> pd.DataFrame:
+    d = normalize_loaded_event_study(event)
+    d["signal_date"] = pd.to_datetime(d["signal_date"], errors="coerce")
+    d = d[d["signal_date"].between(HIST_START, HIST_END, inclusive="both")].copy()
+    d["year"] = d["signal_date"].dt.year
+    d["priced"] = pd.to_numeric(d.get("excess_5"), errors="coerce").notna()
+    ps = d.get("price_status", pd.Series("", index=d.index)).fillna("").astype(str)
+    d["_price_status"] = ps
+    rows = []
+    for year, g in d.groupby("year"):
+        rows.append({
+            "year": int(year),
+            "events": int(len(g)),
+            "priced": int(g["priced"].sum()),
+            "coverage_%": float(100 * g["priced"].mean()) if len(g) else np.nan,
+            "missing_price": int(g["_price_status"].eq("missing_price").sum()),
+            "missing_ticker": int(g["_price_status"].eq("missing_ticker").sum()),
+            "stale_symbol_or_gap": int(g["_price_status"].eq("stale_symbol_or_gap").sum()),
+            "bad_entry_or_other": int((~g["priced"] & ~g["_price_status"].isin(["missing_price", "missing_ticker", "stale_symbol_or_gap"])).sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+st.divider()
+st.header("Robustness Audit — v0.13")
+st.caption(
+    "Nessun nuovo filtro e nessun retuning. Questa sezione verifica le regole A/B/C già congelate: "
+    "stabilità annuale, anni di stress 2008/2020, dipendenza dagli outlier, valore incrementale della fascia $100k–250k "
+    "e rischio di bias dovuto ai prezzi Yahoo mancanti."
+)
+st.warning(
+    "Regola metodologica: i risultati di questo audit non devono essere usati per scegliere una nuova soglia. "
+    "Se una regola fallisce un controllo, il risultato va registrato come limite della regola congelata."
+)
+
+uploaded_audit_event = st.file_uploader(
+    "Carica insider_event_study_2006_2021.csv completato (se non è già disponibile nella sessione)",
+    type=["csv"], key="robust_audit_upload_v013"
+)
+if uploaded_audit_event is not None and st.button("Usa Event Study per Robustness Audit", key="use_audit_event_v013"):
+    try:
+        aud = normalize_loaded_event_study(pd.read_csv(uploaded_audit_event, low_memory=False))
+        st.session_state["robust_event_v013"] = aud
+        st.success(f"Event Study caricato per audit: {len(aud):,} righe.")
+    except Exception as exc:
+        st.error(f"CSV non compatibile: {exc}")
+
+if "robust_event_v013" not in st.session_state:
+    if isinstance(st.session_state.get("hist_event_v012"), pd.DataFrame) and not st.session_state["hist_event_v012"].empty:
+        st.session_state["robust_event_v013"] = st.session_state["hist_event_v012"]
+
+robust_event = st.session_state.get("robust_event_v013")
+if isinstance(robust_event, pd.DataFrame) and not robust_event.empty:
+    with st.spinner("Calcolo Robustness Audit v0.13..."):
+        selected_sets = _audit_selected_sets(robust_event, episode_gap_days=10)
+        all_cov = _audit_all_price_status_by_year(robust_event)
+        miss = _audit_missing_data(selected_sets, horizons=(1, 5))
+        annual = _audit_yearly_tables(selected_sets, horizons=(1, 5))
+        stress = _audit_stress_periods(selected_sets, horizons=(1, 5))
+        outliers = _audit_outliers(selected_sets, horizons=(1, 5))
+        c_desc, c_boot = _audit_c_vs_b_other(robust_event, episode_gap_days=10)
+
+    st.subheader("1. Copertura prezzi e missing-data bias")
+    st.markdown("**Copertura Yahoo di tutti i segnali per anno**")
+    ac = all_cov.copy()
+    if "coverage_%" in ac: ac["coverage_%"] = ac["coverage_%"].round(2)
+    st.dataframe(ac, use_container_width=True, hide_index=True)
+
+    mp = miss.copy()
+    for c in ["observed_mean_excess", "break_even_missing_avg_excess_to_zero"]:
+        if c in mp: mp[c] = (mp[c] * 100).round(2)
+    if "coverage_%" in mp: mp["coverage_%"] = mp["coverage_%"].round(2)
+    mp = mp.rename(columns={
+        "observed_mean_excess":"observed_mean_excess_%",
+        "break_even_missing_avg_excess_to_zero":"missing_avg_break_even_to_zero_%",
+    })
+    st.markdown("**Missing-data stress per configurazione congelata**")
+    st.dataframe(mp, use_container_width=True, hide_index=True)
+    st.caption(
+        "missing_avg_break_even_to_zero_% = rendimento excess medio ipotetico degli eventi non prezzati che, se fosse reale, "
+        "porterebbe la media dell'intero campione selezionato a zero. Non è una stima dei rendimenti mancanti: è uno stress test."
+    )
+
+    st.subheader("2. Stabilità anno per anno")
+    annual_show = annual.copy()
+    for c in ["mean_excess", "trimmed_mean_1pct", "median_excess", "win_rate"]:
+        if c in annual_show: annual_show[c] = (annual_show[c] * 100).round(2)
+    if "coverage_%" in annual_show: annual_show["coverage_%"] = annual_show["coverage_%"].round(2)
+    annual_show = annual_show.rename(columns={
+        "mean_excess":"mean_excess_%", "trimmed_mean_1pct":"trimmed_mean_1pct_%",
+        "median_excess":"median_excess_%", "win_rate":"win_rate_%",
+    })
+    st.dataframe(annual_show, use_container_width=True, hide_index=True)
+    st.caption("small_sample_flag = meno di 30 eventi prezzati oppure meno di 20 issuer: il dato annuale va letto con particolare cautela.")
+
+    st.subheader("3. Anni di stress predefiniti: 2008 e 2020")
+    sp = stress.copy()
+    for c in ["mean_excess", "trimmed_mean_1pct", "median_excess", "win_rate"]:
+        if c in sp: sp[c] = (sp[c] * 100).round(2)
+    sp = sp.rename(columns={
+        "mean_excess":"mean_excess_%", "trimmed_mean_1pct":"trimmed_mean_1pct_%",
+        "median_excess":"median_excess_%", "win_rate":"win_rate_%",
+    })
+    st.dataframe(sp, use_container_width=True, hide_index=True)
+
+    st.subheader("4. Dipendenza dagli outlier")
+    op = outliers.copy()
+    for c in ["mean_excess", "trimmed_mean_1pct", "winsorized_mean_1pct", "median_excess", "win_rate", "p01", "p99", "min", "max", "mean_without_top1pct_winners", "top1pct_share_of_positive_sum"]:
+        if c in op: op[c] = (op[c] * 100).round(2)
+    op = op.rename(columns={
+        "mean_excess":"mean_excess_%", "trimmed_mean_1pct":"trimmed_mean_1pct_%",
+        "winsorized_mean_1pct":"winsorized_mean_1pct_%", "median_excess":"median_excess_%",
+        "win_rate":"win_rate_%", "p01":"p01_%", "p99":"p99_%", "min":"min_%", "max":"max_%",
+        "mean_without_top1pct_winners":"mean_without_top1pct_winners_%",
+        "top1pct_share_of_positive_sum":"top1pct_share_of_positive_sum_%",
+    })
+    st.dataframe(op, use_container_width=True, hide_index=True)
+
+    st.subheader("5. La fascia $100k–250k aggiunge davvero qualcosa a B?")
+    st.caption(
+        "Confronto corretto tra gruppi mutuamente esclusivi: C ($100k–250k) contro il resto dei FIRST_CLUSTER ≥3 insider. "
+        "Non confrontiamo C contro B completo, perché C è un sottoinsieme di B."
+    )
+    cd = c_desc.copy()
+    for c in ["mean_excess", "trimmed_mean_1pct", "median_excess", "win_rate"]:
+        if c in cd: cd[c] = (cd[c] * 100).round(2)
+    cd = cd.rename(columns={
+        "mean_excess":"mean_excess_%", "trimmed_mean_1pct":"trimmed_mean_1pct_%",
+        "median_excess":"median_excess_%", "win_rate":"win_rate_%",
+    })
+    st.dataframe(cd, use_container_width=True, hide_index=True)
+    cb = c_boot.copy()
+    for c in ["observed_diff", "ci95_low", "ci95_high"]:
+        if c in cb: cb[c] = (cb[c] * 100).round(2)
+    cb = cb.rename(columns={"observed_diff":"diff_media_%", "ci95_low":"CI95_low_%", "ci95_high":"CI95_high_%"})
+    st.dataframe(cb, use_container_width=True, hide_index=True)
+    if not cb.empty and not bool(cb.get("CI_interamente_>0", pd.Series(False)).any()):
+        st.info("Nel test diretto C vs resto di B, nessun orizzonte ha CI95% interamente sopra zero: la fascia $100k–250k può descrivere un sottogruppo forte, ma il suo valore incrementale rispetto a ≥3 insider non è ancora dimostrato.")
+
+    export_parts = []
+    for name, frame in [
+        ("coverage_all_by_year", all_cov), ("missing_stress", miss), ("annual", annual),
+        ("stress_periods", stress), ("outlier_audit", outliers),
+        ("C_vs_Bother_descriptive", c_desc), ("C_vs_Bother_bootstrap", c_boot),
+    ]:
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            z = frame.copy(); z.insert(0, "table", name); export_parts.append(z)
+    if export_parts:
+        audit_export = pd.concat(export_parts, ignore_index=True, sort=False)
+        st.download_button(
+            "Scarica Robustness Audit v0.13 CSV",
+            audit_export.to_csv(index=False).encode("utf-8"),
+            file_name="insider_robustness_audit_v0_13.csv",
+            mime="text/csv",
+        )
+else:
+    st.info("Per il Robustness Audit carica il CSV completo insider_event_study_2006_2021.csv oppure completa/carica H3-H4 sopra.")
