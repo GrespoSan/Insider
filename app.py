@@ -23,7 +23,7 @@ from live_engine import (
     sync_live_sec,
 )
 
-VERSION = "1.3"
+VERSION = "1.3.1"
 STATE_DIR = Path("data/live_v1")
 paths = live_state_paths(STATE_DIR)
 paths["root"].mkdir(parents=True, exist_ok=True)
@@ -277,6 +277,17 @@ if not view.empty:
             height=min(420, 74 + 35 * len(focus_show)),
         )
 
+    st.success(
+        "**Questa è la lista principale da controllare oggi.** "
+        "Le sezioni successive sono il dettaglio del Radar: NUOVI, ATTIVI, COMPLETATI e anomalie."
+    )
+
+    st.markdown("### Dettaglio Radar")
+    st.caption(
+        "Qui sotto ritrovi gli stessi segnali organizzati per stato operativo. "
+        "Usa questa parte per capire dove si trova ogni segnale nel ciclo 0/5 → 5/5, non come seconda lista di priorità."
+    )
+
     # Status summary: these are workflow states, not trading recommendations.
     status_counts = filt["operational_bucket"].value_counts()
     m = st.columns(5)
@@ -385,7 +396,7 @@ if not view.empty:
     )
 
 st.divider()
-st.header("Forward Registry — v1.3")
+st.header("Forward Registry — v1.3.1")
 registry = load_forward_registry(STATE_DIR)
 meta = load_forward_registry_meta(STATE_DIR)
 if registry.empty:
@@ -407,7 +418,7 @@ else:
     rcols[4].metric("Avvio registro", str(meta.get("initialized_at", "—"))[:10])
 
     st.caption(
-        "I segnali già presenti al primo avvio della v1.2/v1.3 sono marcati **BASELINE** e restano separati dal vero test prospettico. "
+        "I segnali già presenti al primo avvio della v1.2/v1.3/v1.3.1 sono marcati **BASELINE** e restano separati dal vero test prospettico. "
         "Solo i segnali comparsi successivamente sono **FORWARD**. Una volta raggiunte 5 sedute, Ret 5 ed Excess 5 vengono congelati e non riscritti dai refresh successivi."
     )
 
@@ -449,7 +460,7 @@ st.divider()
 with st.expander("Metodo congelato e limiti"):
     st.markdown(
         """
-- **Forward Registry v1.3:** il primo avvio crea una BASELINE separata; soltanto i segnali successivi sono FORWARD. A 5 sedute il risultato viene congelato e non viene riscritto.
+- **Forward Registry v1.3.1:** il primo avvio crea una BASELINE separata; soltanto i segnali successivi sono FORWARD. A 5 sedute il risultato viene congelato e non viene riscritto.
 - **Fonte:** SEC EDGAR Form 4 originali. Il radar mantiene solo acquisti **P** di common/ordinary shares, acquisizione **A**, prezzo e quantità positivi.
 - **Attribuzione prudente:** filing con più reporting owner vengono scartati; vengono mantenuti Officer/Director; 10b5-1 viene escluso quando esplicitamente marcato.
 - **Componente minimo:** $10.000, come nella ricerca congelata.
@@ -458,7 +469,7 @@ with st.expander("Metodo congelato e limiti"):
 - **CORE:** primo episodio che raggiunge almeno 3 insider distinti.
 - **VALUE:** $100k–250k in dollari 2026 è un tag, non un filtro obbligatorio.
 - **Orizzonte empirico:** 5 sedute è risultato più robusto di 1 seduta nella replica storica; non implica che ogni segnale salirà.
-- **Stati v1.3:** NUOVO = nessuna seduta successiva ancora disponibile; ATTIVO = 1–4 sedute osservate; COMPLETATO = almeno 5 sedute; DA VERIFICARE = ticker/prezzo/storico non risolto; DA PREZZARE = snapshot Yahoo non ancora aggiornato.
+- **Stati v1.3.1:** NUOVO = nessuna seduta successiva ancora disponibile; ATTIVO = 1–4 sedute osservate; COMPLETATO = almeno 5 sedute; DA VERIFICARE = ticker/prezzo/storico non risolto; DA PREZZARE = snapshot Yahoo non ancora aggiornato.
 - **Prezzi:** Yahoo è usato soltanto per il contesto operativo; ticker mancanti/delistati possono non essere prezzabili.
 - **Live:** per non trasformare Streamlit in un crawler pesante, il sync recente è checkpointed e può richiedere più esecuzioni.
         """
