@@ -499,8 +499,245 @@ def historical_price_coverage(event: pd.DataFrame) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+
+
+def _event_summary_checkpoint_local(event: pd.DataFrame, horizons: tuple[int, ...]) -> pd.DataFrame:
+    """Descriptive summary for the local deployment-safe checkpoint runner."""
+    rows = []
+    if event is None or event.empty:
+        return pd.DataFrame()
+    for cluster_value, subgroup in event.groupby("cluster", dropna=False):
+        for h in horizons:
+            col = f"excess_{h}"
+            if col not in subgroup.columns:
+                continue
+            x = pd.to_numeric(subgroup[col], errors="coerce").dropna()
+            if x.empty:
+                continue
+            lo, hi = x.quantile(0.01), x.quantile(0.99)
+            trimmed = x[(x >= lo) & (x <= hi)]
+            rows.append({
+                "group": "CLUSTER" if (not pd.isna(cluster_value) and bool(cluster_value)) else "SOLO",
+                "horizon_sessions": h,
+                "n": int(x.size),
+                "n_issuers": int(subgroup.loc[x.index, "issuer_cik"].astype(str).nunique()) if "issuer_cik" in subgroup.columns else 0,
+                "mean_excess": float(x.mean()),
+                "trimmed_mean_excess_1pct": float(trimmed.mean()) if not trimmed.empty else np.nan,
+                "median_excess": float(x.median()),
+                "win_rate_excess": float((x > 0).mean()),
+                "p01_excess": float(lo),
+                "p99_excess": float(hi),
+            })
+    return pd.DataFrame(rows)
+
+
+def _signals_signature_checkpoint_local(sig: pd.DataFrame) -> str:
+    import hashlib
+    cols = [c for c in ["issuer_cik", "ticker", "signal_date", "accessions", "cluster_value", "n_insiders"] if c in sig.columns]
+    core = sig[cols].copy() if cols else sig.copy()
+    for c in core.columns:
+        if "date" in c.lower():
+            core[c] = pd.to_datetime(core[c], errors="coerce").astype(str)
+    h = pd.util.hash_pandas_object(core.fillna("").astype(str), index=False).values.tobytes()
+    return hashlib.sha256(h).hexdigest()
+
+
+def backtest_signals_checkpointed_local(
+    signals: pd.DataFrame,
+    checkpoint_path: str | Path,
+    horizons: tuple[int, ...] = (1, 5),
+    benchmark: str = "SPY",
+    batch_size: int = 40,
+    max_entry_lag_days: int = 7,
+    progress_callback=None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Deployment-safe fallback for v0.12 historical Yahoo backtest.
+
+    It is intentionally kept in app.py so H3 still works when Streamlit Cloud serves an
+    older engine.py that has the v0.8-v0.11 Yahoo helpers but not the new checkpoint wrapper.
+    """
+    import json
+
+    if signals is None or signals.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    required_helpers = ["_naive_timestamp", "yahoo_symbol", "_download_yahoo_prices", "_safe_text", "_scalar_float"]
+    missing = [name for name in required_helpers if not hasattr(engine_mod, name)]
+    if missing:
+        raise RuntimeError(
+            "engine.py è troppo vecchio anche per il fallback v0.12.1. Mancano: " + ", ".join(missing)
+        )
+
+    naive_ts = engine_mod._naive_timestamp
+    yahoo_symbol_fn = engine_mod.yahoo_symbol
+    download_prices = engine_mod._download_yahoo_prices
+    safe_text = engine_mod._safe_text
+    scalar_float = engine_mod._scalar_float
+
+    cp = Path(checkpoint_path)
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    meta_path = cp.with_suffix(cp.suffix + ".meta.json")
+
+    sig = signals.copy().reset_index(drop=True)
+    sig["signal_date"] = sig["signal_date"].map(naive_ts)
+    sig["yahoo_symbol"] = sig["ticker"].map(yahoo_symbol_fn)
+    sig["_source_row_id"] = np.arange(len(sig), dtype=int)
+    signature = _signals_signature_checkpoint_local(sig)
+
+    existing = pd.DataFrame()
+    if cp.exists() and cp.stat().st_size > 0:
+        if not meta_path.exists():
+            raise ValueError("Checkpoint storico presente ma senza metadata. Azzera il checkpoint e riparti.")
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("signals_signature") != signature or tuple(meta.get("horizons", [])) != tuple(horizons):
+            raise ValueError("Il checkpoint storico appartiene a un diverso set di segnali/regole. Azzera il checkpoint prima di continuare.")
+        existing = pd.read_csv(cp, low_memory=False)
+        if "_source_row_id" not in existing.columns:
+            raise ValueError("Checkpoint storico non compatibile. Azzera il checkpoint e riparti.")
+        existing["_source_row_id"] = pd.to_numeric(existing["_source_row_id"], errors="coerce").astype("Int64")
+    else:
+        meta_path.write_text(json.dumps({
+            "signals_signature": signature,
+            "horizons": list(horizons),
+            "benchmark": benchmark,
+            "max_entry_lag_days": int(max_entry_lag_days),
+            "runner": "app-local-v0.12.1",
+        }, indent=2), encoding="utf-8")
+
+    completed_ids = set()
+    if not existing.empty:
+        completed_ids = set(pd.to_numeric(existing["_source_row_id"], errors="coerce").dropna().astype(int).tolist())
+    pending = sig[~sig["_source_row_id"].isin(completed_ids)].copy()
+
+    if pending.empty:
+        event = existing.sort_values("_source_row_id").reset_index(drop=True)
+        return event, _event_summary_checkpoint_local(event, horizons)
+
+    start = sig["signal_date"].min() - pd.Timedelta(days=10)
+    end = sig["signal_date"].max() + pd.Timedelta(days=max(horizons) * 2 + 30)
+    bench_map = download_prices([benchmark], start, end, batch_size=1)
+    bench = bench_map.get(benchmark, pd.DataFrame())
+    if not bench.empty:
+        bench = bench.copy()
+        bench.index = pd.DatetimeIndex([naive_ts(x) for x in bench.index])
+
+    def blank_base(row):
+        base = row.to_dict()
+        for h in horizons:
+            base[f"ret_{h}"] = np.nan
+            base[f"spy_{h}"] = np.nan
+            base[f"excess_{h}"] = np.nan
+        return base
+
+    def persist(add_rows):
+        nonlocal existing
+        if not add_rows:
+            return
+        add = pd.DataFrame(add_rows)
+        existing = pd.concat([existing, add], ignore_index=True) if not existing.empty else add
+        existing = existing.drop_duplicates("_source_row_id", keep="last").sort_values("_source_row_id")
+        tmp = cp.with_suffix(cp.suffix + ".tmp")
+        existing.to_csv(tmp, index=False)
+        tmp.replace(cp)
+
+    missing_ticker = pending[pending["yahoo_symbol"].map(lambda x: not bool(safe_text(x)))]
+    missing_rows = []
+    for _, row in missing_ticker.iterrows():
+        base = blank_base(row)
+        base["price_status"] = "missing_ticker"
+        missing_rows.append(base)
+    persist(missing_rows)
+
+    pending = pending[pending["yahoo_symbol"].map(lambda x: bool(safe_text(x)))].copy()
+    valid_symbols = sorted(pending["yahoo_symbol"].astype(str).unique().tolist())
+    n_batches = max(1, (len(valid_symbols) + batch_size - 1) // batch_size) if valid_symbols else 0
+
+    for batch_no, pos in enumerate(range(0, len(valid_symbols), batch_size), start=1):
+        batch = valid_symbols[pos:pos + batch_size]
+        prices = download_prices(batch, start, end, batch_size=len(batch))
+        batch_sig = pending[pending["yahoo_symbol"].isin(batch)]
+        batch_rows = []
+
+        for _, row in batch_sig.iterrows():
+            try:
+                sym = safe_text(row.get("yahoo_symbol", ""))
+                base = blank_base(row)
+                px = prices.get(sym, pd.DataFrame())
+                if px.empty or bench.empty:
+                    base["price_status"] = "missing_price"
+                    batch_rows.append(base)
+                    continue
+                signal_ts = naive_ts(row.get("signal_date"))
+                if pd.isna(signal_ts):
+                    base["price_status"] = "invalid_signal_date"
+                    batch_rows.append(base)
+                    continue
+                px = px.copy()
+                px.index = pd.DatetimeIndex([naive_ts(x) for x in px.index])
+                entry_candidates = px.index[px.index > signal_ts]
+                if len(entry_candidates) == 0:
+                    base["price_status"] = "no_future_session"
+                    batch_rows.append(base)
+                    continue
+                entry_date = naive_ts(entry_candidates[0])
+                entry_lag_days = int((entry_date.normalize() - signal_ts.normalize()).days)
+                base["entry_lag_days"] = entry_lag_days
+                base["entry_date"] = entry_date
+                if entry_lag_days > int(max_entry_lag_days):
+                    base["price_status"] = "stale_symbol_or_gap"
+                    batch_rows.append(base)
+                    continue
+                if entry_date not in bench.index:
+                    base["price_status"] = "benchmark_missing_entry"
+                    batch_rows.append(base)
+                    continue
+                entry_open = scalar_float(px.loc[entry_date, "Open"])
+                bench_open = scalar_float(bench.loc[entry_date, "Open"])
+                if not np.isfinite(entry_open) or entry_open <= 0 or not np.isfinite(bench_open) or bench_open <= 0:
+                    base["price_status"] = "bad_entry_price"
+                    batch_rows.append(base)
+                    continue
+                loc = px.index.get_loc(entry_date)
+                if not isinstance(loc, (int, np.integer)):
+                    loc = int(np.flatnonzero(px.index == entry_date)[0])
+                base["entry_open"] = entry_open
+                base["price_status"] = "ok"
+                for h in horizons:
+                    exit_pos = int(loc) + h - 1
+                    if exit_pos >= len(px.index):
+                        continue
+                    exit_date = px.index[exit_pos]
+                    if exit_date not in bench.index:
+                        continue
+                    stock_close = scalar_float(px.iloc[exit_pos]["Close"])
+                    spy_close = scalar_float(bench.loc[exit_date, "Close"])
+                    if not np.isfinite(stock_close) or stock_close <= 0 or not np.isfinite(spy_close) or spy_close <= 0:
+                        continue
+                    ret = stock_close / entry_open - 1.0
+                    spy_ret = spy_close / bench_open - 1.0
+                    base[f"ret_{h}"] = ret
+                    base[f"spy_{h}"] = spy_ret
+                    base[f"excess_{h}"] = ret - spy_ret
+                batch_rows.append(base)
+            except Exception as exc:
+                err = blank_base(row)
+                err["price_status"] = f"row_error_{type(exc).__name__}"
+                err["price_error"] = str(exc)[:240]
+                batch_rows.append(err)
+
+        persist(batch_rows)
+        del prices
+        if progress_callback is not None:
+            try:
+                progress_callback(batch_no, n_batches, len(existing), len(sig))
+            except Exception:
+                pass
+
+    event = existing.sort_values("_source_row_id").reset_index(drop=True)
+    return event, _event_summary_checkpoint_local(event, horizons)
+
 st.set_page_config(page_title="Independent Insider Radar", layout="wide")
-st.title("Independent Insider Radar — v0.12")
+st.title("Independent Insider Radar — v0.12.1")
 st.caption("SEC Form 4 • acquisti P • dati ufficiali gratuiti • nessuno score proprietario")
 
 DATA_DIR = Path("data/sec_form345")
@@ -1066,7 +1303,7 @@ if isinstance(event_adv, pd.DataFrame) and not event_adv.empty:
 
 # --- Historical Replication 2006-2021 (frozen rules) ---
 st.divider()
-st.header("Replica storica indipendente 2006–2021 — v0.12")
+st.header("Replica storica indipendente 2006–2021 — v0.12.1")
 st.info(
     "Test realmente separato dal periodo 2022–2026 usato per esplorare le regole. "
     "Le configurazioni sono congelate: A = FIRST_CLUSTER ≥2; B = FIRST_CLUSTER ≥3; "
@@ -1159,8 +1396,12 @@ with h2:
 st.subheader("Backtest storico Yahoo con checkpoint")
 st.caption(
     "Il test 2006–2021 può richiedere tempo e Yahoo non conserva necessariamente tutti i ticker delistati. "
-    "La v0.12 salva ogni blocco completato: se Streamlit si riavvia, il pulsante H3 riprende dal checkpoint invece di ricominciare da zero."
+    "La v0.12.1 salva ogni blocco completato: se Streamlit si riavvia, il pulsante H3 riprende dal checkpoint invece di ricominciare da zero."
 )
+if hasattr(engine_mod, "backtest_signals_checkpointed"):
+    st.caption("Runner checkpoint: engine.py v0.12 disponibile.")
+else:
+    st.info("Runner checkpoint: fallback locale v0.12.1 attivo. H3 può partire anche se Streamlit sta ancora caricando un engine.py precedente.")
 
 uploaded_hist_event = st.file_uploader(
     "Oppure carica un insider_event_study_2006_2021.csv già completato",
@@ -1179,8 +1420,6 @@ with h3a:
     if st.button("H3. Esegui / riprendi Event Study storico 1/5 sedute", use_container_width=True):
         if not HIST_SIGNALS_PATH.exists():
             st.error("Prima costruisci i segnali storici con H2.")
-        elif not hasattr(engine_mod, "backtest_signals_checkpointed"):
-            st.error("engine.py non è aggiornato alla v0.12. Sostituisci insieme app.py ed engine.py.")
         else:
             hist_signals = normalize_loaded_signals(pd.read_csv(HIST_SIGNALS_PATH, low_memory=False))
             pbar = st.progress(0.0)
@@ -1190,7 +1429,8 @@ with h3a:
                 pbox.caption(f"Yahoo storico: blocco {done}/{total} • checkpoint {rows_done:,}/{rows_total:,} eventi")
             try:
                 with st.spinner("Backtest storico a blocchi; i risultati vengono salvati dopo ogni batch..."):
-                    hev, hsum = engine_mod.backtest_signals_checkpointed(
+                    checkpoint_runner = getattr(engine_mod, "backtest_signals_checkpointed", backtest_signals_checkpointed_local)
+                    hev, hsum = checkpoint_runner(
                         hist_signals,
                         HIST_EVENT_PATH,
                         horizons=(1, 5),
