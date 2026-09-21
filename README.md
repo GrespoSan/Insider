@@ -1,69 +1,55 @@
-# Independent Insider Radar LIVE — v1.1
+# Independent Insider Radar LIVE v1.2
 
-Versione operativa separata dalla fase di ricerca/backtest. La v0.14.1 resta l'archivio della ricerca; questa app monitora i nuovi Form 4 SEC con regole congelate.
+Versione operativa con **Forward Registry automatico**.
 
 ## Regole congelate
+- WATCH = primo cluster con almeno 2 insider distinti
+- CORE = primo cluster con almeno 3 insider distinti
+- VALUE 100–250k (2026$) = tag informativo, non filtro obbligatorio
+- Orizzonte empirico principale = 5 sedute
 
-- Solo Form 4 originali.
-- Solo transazioni non-derivative con codice `P` e acquisizione `A`.
-- Common/ordinary shares; quantità e prezzo positivi.
-- Componente minimo **$10.000**.
-- Solo Officer/Director.
-- Filing con più reporting owner esclusi per prudenza attributiva.
-- 10b5-1 escluso quando esplicitamente marcato.
-- Finestra cluster **±10 giorni** sulle transaction date, senza usare filing futuri.
-- `WATCH`: primo cluster che raggiunge **≥2 insider**.
-- `CORE`: primo cluster che raggiunge **≥3 insider**.
-- `VALUE 100–250k (2026$)`: tag informativo, non filtro obbligatorio.
-- Orizzonte empirico principale osservato: **5 sedute**.
+## Novità v1.2 — Forward Registry
+La v1.2 salva automaticamente ogni CORE/WATCH con contesto completo in `data/live_v1/forward_registry_v1_2.csv`.
 
-## Novità v1.1
+Per evitare di chiamare *forward* ciò che era già noto prima della v1.2:
+- i segnali già presenti al primo avvio vengono marcati **BASELINE**;
+- soltanto i segnali comparsi dopo l'inizializzazione vengono marcati **FORWARD**;
+- quando un segnale raggiunge 5 sedute e dispone di `return_5` ed `excess_5`, l'esito viene **congelato** e non viene riscritto dai successivi refresh Yahoo.
 
-La dashboard operativa è divisa in stati meccanici, non in nuovi segnali:
+Il registro conserva anche entry, stato corrente, CORE/WATCH, VALUE, ruolo CEO/CFO, link SEC e TradingView.
 
-- **NUOVI**: il filing è pubblico ma non esiste ancora una seduta successiva utile per l'entry OPEN.
-- **ATTIVI 1–4/5**: entry disponibile e finestra empirica ancora in corso.
-- **COMPLETATI 5/5**: almeno 5 sedute osservate, con `Return 5D` e `Excess 5D` quando disponibili.
-- **DA VERIFICARE**: Yahoo non risolve correttamente ticker/prezzo/storico.
-- **DA PREZZARE**: il radar è stato costruito ma lo snapshot Yahoo non è ancora stato aggiornato.
+## Flusso quotidiano
+1. `Sync / continua SEC Live` fino a Pendenti = 0.
+2. `Costruisci / aggiorna Radar`.
+3. `Aggiorna prezzi / performance`.
+4. La sezione **Forward Registry — v1.2** si aggiorna automaticamente.
+5. Scarica periodicamente `insider_forward_registry_v1_2.csv` e il backup ZIP.
 
-Per ogni segnale vengono mostrati inoltre:
+## Backup
+Il backup stato live include ora anche:
+- `forward_registry_v1_2.csv`
+- `forward_registry_meta_v1_2.json`
 
-- numero insider e banda `3 / 4 / 5+`;
-- tag `VALUE`;
-- presenza informativa di `CEO`, `CFO` o `CEO+CFO` (nessuno di questi modifica CORE/WATCH);
-- progresso `0/5 ... 5/5`;
-- performance da entry e vs SPY;
-- link SEC e TradingView.
+I vecchi backup v1.0/v1.1 restano importabili; se non contengono un registry, il primo avvio v1.2 crea una nuova BASELINE.
 
-## Export distinti
+## Deploy Streamlit
+Sostituire insieme:
+- `app.py`
+- `engine.py`
+- `live_engine.py`
+- `requirements.txt`
 
-- **Radar completo CSV**: tutti i CORE + WATCH presenti nello stato live, incluso il margine iniziale con contesto cluster incompleto.
-- **Radar operativo CSV**: CORE + WATCH con `context_complete = True`.
-- **Vista filtrata CSV**: esattamente ciò che è selezionato nell'interfaccia.
+Lo stato dati resta nella stessa cartella `data/live_v1`, quindi un deploy sopra la v1.1 può riutilizzare radar e prezzi già presenti finché lo storage della piattaforma li conserva.
 
-Questa distinzione evita di confondere l'universo completo con la vista operativa filtrata.
+## Test
+9 test automatici superati, inclusi:
+- parsing SEC e filtri P/A;
+- costruzione FIRST CORE;
+- bucket operativi;
+- inizializzazione BASELINE;
+- registrazione di nuovi segnali FORWARD;
+- idempotenza del registro;
+- congelamento immutabile del risultato a 5 sedute;
+- separazione BASELINE/FORWARD nelle statistiche.
 
-## Uso
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-1. Inserisci una email nella sidebar per il User-Agent SEC.
-2. Lascia 21 giorni come lookback iniziale.
-3. Premi **1. Sync / continua SEC Live** finché `Pendenti = 0`.
-4. Premi **2. Costruisci / aggiorna Radar**.
-5. Premi **3. Aggiorna prezzi / performance**.
-6. Usa le sezioni NUOVI / ATTIVI / COMPLETATI e salva periodicamente il backup ZIP.
-
-## TradingView
-
-L'app contiene un link TradingView per il ticker. Il plugin TradingView disponibile dentro ChatGPT è separato da Streamlit e può essere usato in chat per una verifica qualitativa dei pochi CORE emersi dal radar.
-
-## Limiti
-
-- Il primo sync può richiedere più esecuzioni.
-- Yahoo può non avere prezzi per ticker delistati/rinominati.
-- `CORE`, `WATCH` e `VALUE` sono etichette di ricerca/monitoraggio, non raccomandazioni d'investimento.
+CORE/WATCH restano classificazioni quantitative del pattern studiato, non raccomandazioni di investimento.

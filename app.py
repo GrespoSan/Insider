@@ -13,13 +13,17 @@ from live_engine import (
     enrich_live_prices,
     export_state_zip,
     import_state_zip,
+    forward_registry_summary,
+    load_forward_registry,
+    load_forward_registry_meta,
+    update_forward_registry,
     live_state_paths,
     load_live_components,
     state_summary,
     sync_live_sec,
 )
 
-VERSION = "1.1"
+VERSION = "1.2"
 STATE_DIR = Path("data/live_v1")
 paths = live_state_paths(STATE_DIR)
 paths["root"].mkdir(parents=True, exist_ok=True)
@@ -43,7 +47,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Backup stato live")
-    uploaded_state = st.file_uploader("Ripristina live_state_v1.zip", type=["zip"])
+    uploaded_state = st.file_uploader("Ripristina live_state_v1*.zip", type=["zip"])
     if uploaded_state is not None and st.button("Ripristina stato"):
         try:
             restored = import_state_zip(uploaded_state.getvalue(), STATE_DIR)
@@ -166,6 +170,11 @@ if "live_priced" not in st.session_state and paths["prices"].exists():
 view = st.session_state.get("live_priced", radar)
 if not view.empty:
     view = add_operational_columns(view)
+    try:
+        forward_registry = update_forward_registry(view, STATE_DIR)
+    except Exception as exc:
+        forward_registry = load_forward_registry(STATE_DIR)
+        st.warning(f"Forward registry non aggiornato in questo passaggio: {type(exc).__name__}: {exc}")
     st.divider()
     st.header("Radar operativo")
 
@@ -275,21 +284,21 @@ if not view.empty:
     d1.download_button(
         "Scarica radar completo CSV",
         data=full_export.to_csv(index=False).encode("utf-8"),
-        file_name="insider_live_radar_complete_v1_1.csv",
+        file_name="insider_live_radar_complete_v1_2.csv",
         mime="text/csv",
         use_container_width=True,
     )
     d2.download_button(
         "Scarica radar operativo CSV",
         data=operational_export.to_csv(index=False).encode("utf-8"),
-        file_name="insider_live_radar_operational_v1_1.csv",
+        file_name="insider_live_radar_operational_v1_2.csv",
         mime="text/csv",
         use_container_width=True,
     )
     d3.download_button(
         "Scarica vista filtrata CSV",
         data=filt.to_csv(index=False).encode("utf-8"),
-        file_name="insider_live_radar_filtered_v1_1.csv",
+        file_name="insider_live_radar_filtered_v1_2.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -297,8 +306,69 @@ if not view.empty:
     st.download_button(
         "Backup stato live ZIP",
         data=export_state_zip(STATE_DIR),
-        file_name="insider_live_state_v1.zip",
+        file_name="insider_live_state_v1_2.zip",
         mime="application/zip",
+        use_container_width=True,
+    )
+
+st.divider()
+st.header("Forward Registry — v1.2")
+registry = load_forward_registry(STATE_DIR)
+meta = load_forward_registry_meta(STATE_DIR)
+if registry.empty:
+    st.info("Il registro forward verrà inizializzato automaticamente appena esiste almeno un CORE/WATCH con contesto completo.")
+else:
+    reg = registry.copy()
+    reg["frozen"] = reg["frozen"].fillna(False).astype(bool)
+    origin = reg["tracking_origin"].fillna("").astype(str)
+    fwd = reg[origin.eq("FORWARD")].copy()
+    baseline = reg[origin.eq("BASELINE")].copy()
+    fwd_active = fwd[~fwd["frozen"]].copy()
+    fwd_done = fwd[fwd["frozen"]].copy()
+
+    rcols = st.columns(5)
+    rcols[0].metric("Baseline migrata", f"{len(baseline):,}")
+    rcols[1].metric("Forward registrati", f"{len(fwd):,}")
+    rcols[2].metric("Forward attivi", f"{len(fwd_active):,}")
+    rcols[3].metric("Forward completati 5D", f"{len(fwd_done):,}")
+    rcols[4].metric("Avvio registro", str(meta.get("initialized_at", "—"))[:10])
+
+    st.caption(
+        "I segnali già presenti al primo avvio della v1.2 sono marcati **BASELINE** e restano separati dal vero test prospettico. "
+        "Solo i segnali comparsi successivamente sono **FORWARD**. Una volta raggiunte 5 sedute, Ret 5 ed Excess 5 vengono congelati e non riscritti dai refresh successivi."
+    )
+
+    perf = forward_registry_summary(reg)
+    if not perf.empty:
+        show_perf = perf.copy()
+        st.subheader("Risultati descrittivi del registro")
+        st.dataframe(show_perf, use_container_width=True, hide_index=True)
+
+    st.subheader("Ultimi segnali registrati")
+    reg_show = reg.sort_values("signal_date", ascending=False).head(80).copy()
+    for pct in ["current_return_since_entry", "current_excess_since_entry", "return_5", "excess_5"]:
+        if pct in reg_show.columns:
+            reg_show[pct] = pd.to_numeric(reg_show[pct], errors="coerce") * 100.0
+    reg_cols = [c for c in [
+        "tracking_origin", "priority", "ticker", "issuer_name", "signal_date", "n_insiders", "cluster_value",
+        "value_flag", "role_tag", "sessions_observed", "operational_bucket", "current_excess_since_entry",
+        "frozen", "exit_5_date", "excess_5", "sec_url", "tradingview_url"
+    ] if c in reg_show.columns]
+    reg_cfg = {
+        "signal_date": st.column_config.DateColumn("Trigger SEC", format="DD/MM/YYYY"),
+        "exit_5_date": st.column_config.DateColumn("5ª seduta", format="DD/MM/YYYY"),
+        "cluster_value": st.column_config.NumberColumn("Valore cluster", format="$ %.0f"),
+        "current_excess_since_entry": st.column_config.NumberColumn("Excess corrente", format="%.2f%%"),
+        "excess_5": st.column_config.NumberColumn("Excess 5 congelato", format="%.2f%%"),
+        "sec_url": st.column_config.LinkColumn("SEC", display_text="SEC"),
+        "tradingview_url": st.column_config.LinkColumn("TV", display_text="TV"),
+    }
+    st.dataframe(reg_show[reg_cols], use_container_width=True, hide_index=True, column_config=reg_cfg)
+    st.download_button(
+        "Scarica Forward Registry CSV",
+        data=reg.to_csv(index=False).encode("utf-8"),
+        file_name="insider_forward_registry_v1_2.csv",
+        mime="text/csv",
         use_container_width=True,
     )
 
@@ -306,6 +376,7 @@ st.divider()
 with st.expander("Metodo congelato e limiti"):
     st.markdown(
         """
+- **Forward Registry v1.2:** il primo avvio crea una BASELINE separata; soltanto i segnali successivi sono FORWARD. A 5 sedute il risultato viene congelato e non viene riscritto.
 - **Fonte:** SEC EDGAR Form 4 originali. Il radar mantiene solo acquisti **P** di common/ordinary shares, acquisizione **A**, prezzo e quantità positivi.
 - **Attribuzione prudente:** filing con più reporting owner vengono scartati; vengono mantenuti Officer/Director; 10b5-1 viene escluso quando esplicitamente marcato.
 - **Componente minimo:** $10.000, come nella ricerca congelata.
@@ -314,7 +385,7 @@ with st.expander("Metodo congelato e limiti"):
 - **CORE:** primo episodio che raggiunge almeno 3 insider distinti.
 - **VALUE:** $100k–250k in dollari 2026 è un tag, non un filtro obbligatorio.
 - **Orizzonte empirico:** 5 sedute è risultato più robusto di 1 seduta nella replica storica; non implica che ogni segnale salirà.
-- **Stati v1.1:** NUOVO = nessuna seduta successiva ancora disponibile; ATTIVO = 1–4 sedute osservate; COMPLETATO = almeno 5 sedute; DA VERIFICARE = ticker/prezzo/storico non risolto; DA PREZZARE = snapshot Yahoo non ancora aggiornato.
+- **Stati v1.2:** NUOVO = nessuna seduta successiva ancora disponibile; ATTIVO = 1–4 sedute osservate; COMPLETATO = almeno 5 sedute; DA VERIFICARE = ticker/prezzo/storico non risolto; DA PREZZARE = snapshot Yahoo non ancora aggiornato.
 - **Prezzi:** Yahoo è usato soltanto per il contesto operativo; ticker mancanti/delistati possono non essere prezzabili.
 - **Live:** per non trasformare Streamlit in un crawler pesante, il sync recente è checkpointed e può richiedere più esecuzioni.
         """

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import time
 import zipfile
@@ -48,7 +49,7 @@ def _sec_headers(contact_email: str) -> dict[str, str]:
     if not email or "@" not in email:
         raise ValueError("Inserisci una email valida per il User-Agent SEC.")
     return {
-        "User-Agent": f"IndependentInsiderRadarLive/1.1 {email}",
+        "User-Agent": f"IndependentInsiderRadarLive/1.2 {email}",
         "Accept-Encoding": "gzip, deflate",
     }
 
@@ -352,6 +353,8 @@ def live_state_paths(state_dir: str | Path) -> dict[str, Path]:
         "components": root / "live_components.csv",
         "radar": root / "live_radar.csv",
         "prices": root / "live_radar_prices.csv",
+        "forward_registry": root / "forward_registry_v1_2.csv",
+        "forward_meta": root / "forward_registry_meta_v1_2.json",
         "index_cache": root / "index_cache",
     }
 
@@ -697,6 +700,7 @@ def enrich_live_prices(
         "excess_since_entry": np.nan,
         "return_5": np.nan,
         "excess_5": np.nan,
+        "exit_5_date": pd.NaT,
         "price_status": "not_requested",
     }
     for c, v in cols_defaults.items():
@@ -778,6 +782,7 @@ def enrich_live_prices(
                 r5 = close5 / entry_open - 1.0
                 out.at[idx, "return_5"] = r5
                 out.at[idx, "excess_5"] = r5 - (b5_close / b_open - 1.0)
+                out.at[idx, "exit_5_date"] = exit_date
 
     out["operational_status"] = np.where(
         (out["price_status"].eq("ok")) & (pd.to_numeric(out["sessions_observed"], errors="coerce") <= 5),
@@ -786,6 +791,237 @@ def enrich_live_prices(
     )
     return out
 
+
+
+FORWARD_REGISTRY_COLUMNS = [
+    "signal_key", "tracking_origin", "registered_at", "last_seen_at", "registration_version",
+    "priority", "ticker", "issuer_cik", "issuer_name", "signal_date", "n_insiders", "cluster_value",
+    "value_flag", "role_tag", "owners", "roles", "sec_url", "tradingview_url",
+    "entry_date", "entry_open", "latest_price_date", "latest_close", "sessions_observed",
+    "current_return_since_entry", "current_excess_since_entry", "price_status", "operational_bucket",
+    "frozen", "completed_at", "exit_5_date", "return_5", "excess_5",
+]
+
+
+def _utc_now_text() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _registry_bool(value) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return str(value or "").strip().lower() in TRUE_VALUES
+
+
+def _safe_date_text(value) -> str:
+    dt = pd.to_datetime(value, errors="coerce")
+    return "" if pd.isna(dt) else pd.Timestamp(dt).strftime("%Y-%m-%d")
+
+
+def _safe_num(value):
+    x = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return float(x) if pd.notna(x) and np.isfinite(x) else np.nan
+
+
+def _forward_signal_key(row) -> str:
+    issuer = str(row.get("issuer_cik", "") or "").strip()
+    if not issuer or issuer.lower() == "nan":
+        issuer = str(row.get("ticker", "") or "").strip().upper()
+    priority = str(row.get("priority", "") or "").strip().upper()
+    signal_date = _safe_date_text(row.get("signal_date"))
+    return f"{issuer}|{signal_date}|{priority}"
+
+
+def load_forward_registry(state_dir: str | Path) -> pd.DataFrame:
+    path = live_state_paths(state_dir)["forward_registry"]
+    df = _read_csv_or_empty(path, FORWARD_REGISTRY_COLUMNS)
+    if df.empty:
+        return pd.DataFrame(columns=FORWARD_REGISTRY_COLUMNS)
+    for c in FORWARD_REGISTRY_COLUMNS:
+        if c not in df.columns:
+            df[c] = pd.NA
+    for c in ["signal_date", "entry_date", "latest_price_date", "completed_at", "exit_5_date"]:
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+    for c in ["n_insiders", "cluster_value", "entry_open", "latest_close", "sessions_observed",
+              "current_return_since_entry", "current_excess_since_entry", "return_5", "excess_5"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["frozen"] = df["frozen"].map(_registry_bool)
+    return df[FORWARD_REGISTRY_COLUMNS].copy()
+
+
+def load_forward_registry_meta(state_dir: str | Path) -> dict:
+    path = live_state_paths(state_dir)["forward_meta"]
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_forward_meta(state_dir: str | Path, meta: dict) -> None:
+    path = live_state_paths(state_dir)["forward_meta"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def update_forward_registry(snapshot: pd.DataFrame, state_dir: str | Path, *, now_utc: str | None = None) -> pd.DataFrame:
+    """Idempotently register CORE/WATCH signals and freeze their 5-session result.
+
+    The first call creates a BASELINE from signals already present, so pre-v1.2 observations
+    are not silently counted as prospective forward evidence. Signals first appearing after
+    that initialization are labelled FORWARD. Only context-complete CORE/WATCH signals enter.
+    Once return_5/excess_5 are frozen, later price refreshes never rewrite them.
+    """
+    paths = live_state_paths(state_dir)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    now = now_utc or _utc_now_text()
+    meta = load_forward_registry_meta(state_dir)
+    initialized = bool(meta.get("initialized_at"))
+    if not initialized:
+        meta = {"initialized_at": now, "version": "1.2", "note": "Existing eligible signals at initialization are BASELINE."}
+        _write_forward_meta(state_dir, meta)
+
+    reg = load_forward_registry(state_dir)
+    if snapshot is None or snapshot.empty:
+        if not paths["forward_registry"].exists():
+            _atomic_write_csv(reg, paths["forward_registry"])
+        return reg
+
+    snap = add_operational_columns(snapshot)
+    if "context_complete" not in snap.columns:
+        snap["context_complete"] = False
+    eligible = snap[
+        snap.get("priority", pd.Series("", index=snap.index)).isin(["CORE", "WATCH"])
+        & snap["context_complete"].fillna(False).astype(bool)
+    ].copy()
+    if eligible.empty:
+        if not paths["forward_registry"].exists():
+            _atomic_write_csv(reg, paths["forward_registry"])
+        return reg
+
+    eligible["signal_key"] = eligible.apply(_forward_signal_key, axis=1)
+    eligible = eligible[eligible["signal_key"].str.contains(r"\|\d{4}-\d{2}-\d{2}\|", regex=True)].copy()
+    existing = set(reg.get("signal_key", pd.Series(dtype=str)).fillna("").astype(str))
+    origin_for_new = "FORWARD" if initialized else "BASELINE"
+
+    new_rows = []
+    for _, row in eligible.iterrows():
+        key = str(row["signal_key"])
+        if key in existing:
+            continue
+        new_rows.append({
+            "signal_key": key,
+            "tracking_origin": origin_for_new,
+            "registered_at": now,
+            "last_seen_at": now,
+            "registration_version": "1.2",
+            "priority": str(row.get("priority", "")),
+            "ticker": str(row.get("ticker", "") or ""),
+            "issuer_cik": str(row.get("issuer_cik", "") or ""),
+            "issuer_name": str(row.get("issuer_name", "") or ""),
+            "signal_date": _safe_date_text(row.get("signal_date")),
+            "n_insiders": _safe_num(row.get("n_insiders")),
+            "cluster_value": _safe_num(row.get("cluster_value")),
+            "value_flag": str(row.get("value_flag", "") or ""),
+            "role_tag": str(row.get("role_tag", "") or ""),
+            "owners": str(row.get("owners", "") or ""),
+            "roles": str(row.get("roles", "") or ""),
+            "sec_url": str(row.get("sec_url", "") or ""),
+            "tradingview_url": str(row.get("tradingview_url", "") or ""),
+            "entry_date": _safe_date_text(row.get("entry_date")),
+            "entry_open": _safe_num(row.get("entry_open")),
+            "latest_price_date": _safe_date_text(row.get("price_date")),
+            "latest_close": _safe_num(row.get("current_close")),
+            "sessions_observed": _safe_num(row.get("sessions_observed")),
+            "current_return_since_entry": _safe_num(row.get("return_since_entry")),
+            "current_excess_since_entry": _safe_num(row.get("excess_since_entry")),
+            "price_status": str(row.get("price_status", "not_requested") or "not_requested"),
+            "operational_bucket": str(row.get("operational_bucket", "") or ""),
+            "frozen": False,
+            "completed_at": "",
+            "exit_5_date": _safe_date_text(row.get("exit_5_date")),
+            "return_5": np.nan,
+            "excess_5": np.nan,
+        })
+        existing.add(key)
+    if new_rows:
+        reg = pd.concat([reg, pd.DataFrame(new_rows)], ignore_index=True)
+
+    # Update dynamic fields. Frozen 5-session outcomes are immutable.
+    by_key = {str(r["signal_key"]): r for _, r in eligible.iterrows()}
+    for i in reg.index:
+        key = str(reg.at[i, "signal_key"])
+        row = by_key.get(key)
+        if row is None:
+            continue
+        reg.at[i, "last_seen_at"] = now
+        for dst, src in [
+            ("entry_date", "entry_date"), ("entry_open", "entry_open"),
+            ("latest_price_date", "price_date"), ("latest_close", "current_close"),
+            ("sessions_observed", "sessions_observed"),
+            ("current_return_since_entry", "return_since_entry"),
+            ("current_excess_since_entry", "excess_since_entry"),
+        ]:
+            val = row.get(src)
+            if dst.endswith("date"):
+                txt = _safe_date_text(val)
+                if txt:
+                    reg.at[i, dst] = txt
+            else:
+                num = _safe_num(val)
+                if np.isfinite(num):
+                    reg.at[i, dst] = num
+        reg.at[i, "price_status"] = str(row.get("price_status", reg.at[i, "price_status"]) or "")
+        reg.at[i, "operational_bucket"] = str(row.get("operational_bucket", reg.at[i, "operational_bucket"]) or "")
+
+        already_frozen = _registry_bool(reg.at[i, "frozen"])
+        r5 = _safe_num(row.get("return_5"))
+        x5 = _safe_num(row.get("excess_5"))
+        sessions = _safe_num(row.get("sessions_observed"))
+        if (not already_frozen) and np.isfinite(r5) and np.isfinite(x5) and np.isfinite(sessions) and sessions >= 5:
+            reg.at[i, "frozen"] = True
+            reg.at[i, "completed_at"] = now
+            exit_txt = _safe_date_text(row.get("exit_5_date"))
+            if exit_txt:
+                reg.at[i, "exit_5_date"] = exit_txt
+            reg.at[i, "return_5"] = r5
+            reg.at[i, "excess_5"] = x5
+            reg.at[i, "operational_bucket"] = "COMPLETATO"
+
+    for c in FORWARD_REGISTRY_COLUMNS:
+        if c not in reg.columns:
+            reg[c] = pd.NA
+    reg = reg.drop_duplicates("signal_key", keep="first")
+    reg["signal_date"] = pd.to_datetime(reg["signal_date"], errors="coerce")
+    reg = reg.sort_values(["signal_date", "priority"], ascending=[False, True]).reset_index(drop=True)
+    _atomic_write_csv(reg[FORWARD_REGISTRY_COLUMNS], paths["forward_registry"])
+    return load_forward_registry(state_dir)
+
+
+def forward_registry_summary(registry: pd.DataFrame) -> pd.DataFrame:
+    """Descriptive 5-session summary. BASELINE and FORWARD are kept separate."""
+    if registry is None or registry.empty:
+        return pd.DataFrame(columns=["tracking_origin", "priority", "n_registered", "n_completed", "mean_excess_5_pct", "median_excess_5_pct", "win_rate_excess_5_pct"])
+    d = registry.copy()
+    d["frozen"] = d["frozen"].map(_registry_bool)
+    d["excess_5"] = pd.to_numeric(d["excess_5"], errors="coerce")
+    rows = []
+    for (origin, priority), g in d.groupby(["tracking_origin", "priority"], dropna=False):
+        done = g[g["frozen"] & g["excess_5"].notna()].copy()
+        rows.append({
+            "tracking_origin": origin,
+            "priority": priority,
+            "n_registered": int(len(g)),
+            "n_completed": int(len(done)),
+            "mean_excess_5_pct": float(done["excess_5"].mean() * 100) if len(done) else np.nan,
+            "median_excess_5_pct": float(done["excess_5"].median() * 100) if len(done) else np.nan,
+            "win_rate_excess_5_pct": float((done["excess_5"] > 0).mean() * 100) if len(done) else np.nan,
+        })
+    return pd.DataFrame(rows)
 
 def state_summary(state_dir: str | Path) -> dict:
     paths = live_state_paths(state_dir)
@@ -809,7 +1045,7 @@ def state_summary(state_dir: str | Path) -> dict:
 
 def export_state_zip(state_dir: str | Path) -> bytes:
     paths = live_state_paths(state_dir)
-    allowed = [paths["index"], paths["processed"], paths["components"], paths["radar"], paths["prices"]]
+    allowed = [paths["index"], paths["processed"], paths["components"], paths["radar"], paths["prices"], paths["forward_registry"], paths["forward_meta"]]
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for p in allowed:
@@ -821,7 +1057,7 @@ def export_state_zip(state_dir: str | Path) -> bytes:
 def import_state_zip(data: bytes, state_dir: str | Path) -> list[str]:
     paths = live_state_paths(state_dir)
     paths["root"].mkdir(parents=True, exist_ok=True)
-    allowed = {p.name for p in [paths["index"], paths["processed"], paths["components"], paths["radar"], paths["prices"]]}
+    allowed = {p.name for p in [paths["index"], paths["processed"], paths["components"], paths["radar"], paths["prices"], paths["forward_registry"], paths["forward_meta"]]}
     restored: list[str] = []
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         for name in zf.namelist():

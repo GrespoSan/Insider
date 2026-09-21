@@ -2,7 +2,7 @@ from datetime import date
 import pandas as pd
 import numpy as np
 
-from live_engine import parse_master_index, parse_form4_xml, build_live_radar, add_operational_columns
+from live_engine import parse_master_index, parse_form4_xml, build_live_radar, add_operational_columns, update_forward_registry, load_forward_registry, forward_registry_summary
 
 
 def sample_xml(code="P", acquired="A", is_director="1", is_officer="0", aff="0", owners=1, title="Common Stock", price="10", shares="2000"):
@@ -98,3 +98,73 @@ def test_operational_buckets_and_day_progress():
     assert row_b["day_5"] == "2/5" and row_b["insider_band"] == "4" and row_b["role_tag"] == "CFO"
     assert row_c["day_5"] == "5/5"
     assert row_d["insider_band"] == "5+" and row_d["role_tag"] == "CEO+CFO"
+
+
+
+def _registry_snapshot(ticker="AAA", priority="CORE", signal_date="2026-09-18", context=True, sessions=1, r5=np.nan, x5=np.nan, status="ok"):
+    return pd.DataFrame([{
+        "priority": priority, "ticker": ticker, "issuer_cik": "123", "issuer_name": "Alpha Inc",
+        "signal_date": pd.Timestamp(signal_date), "n_insiders": 3 if priority == "CORE" else 2,
+        "cluster_value": 150000, "value_tag": "VALUE 100–250k (2026$)", "roles": "CEO; Director",
+        "owners": "One; Two; Three", "context_complete": context, "sec_url": "https://sec.example",
+        "tradingview_url": "https://tv.example", "entry_date": pd.Timestamp("2026-09-19"), "entry_open": 10.0,
+        "price_date": pd.Timestamp("2026-09-20"), "current_close": 10.5, "sessions_observed": sessions,
+        "return_since_entry": 0.05, "excess_since_entry": 0.03, "return_5": r5, "excess_5": x5,
+        "exit_5_date": pd.Timestamp("2026-09-25") if np.isfinite(r5) else pd.NaT, "price_status": status,
+    }])
+
+
+def test_forward_registry_baseline_then_forward(tmp_path):
+    first = _registry_snapshot("AAA")
+    reg = update_forward_registry(first, tmp_path, now_utc="2026-09-21T08:00:00Z")
+    assert len(reg) == 1
+    assert reg.iloc[0]["tracking_origin"] == "BASELINE"
+
+    second = pd.concat([first, _registry_snapshot("BBB", signal_date="2026-09-21")], ignore_index=True)
+    second.loc[1, "issuer_cik"] = "456"
+    reg2 = update_forward_registry(second, tmp_path, now_utc="2026-09-22T08:00:00Z")
+    assert len(reg2) == 2
+    origins = dict(zip(reg2["ticker"], reg2["tracking_origin"]))
+    assert origins == {"BBB": "FORWARD", "AAA": "BASELINE"}
+
+
+def test_forward_registry_freezes_5_session_result(tmp_path):
+    update_forward_registry(_registry_snapshot("AAA"), tmp_path, now_utc="2026-09-21T08:00:00Z")
+    snap_done = _registry_snapshot("BBB", signal_date="2026-09-21", sessions=5, r5=0.12, x5=0.08)
+    snap_done.loc[0, "issuer_cik"] = "456"
+    reg = update_forward_registry(snap_done, tmp_path, now_utc="2026-09-28T08:00:00Z")
+    b = reg[reg["ticker"].eq("BBB")].iloc[0]
+    assert bool(b["frozen"]) is True
+    assert abs(float(b["excess_5"]) - 0.08) < 1e-12
+
+    # A later refresh with different values must not rewrite the frozen outcome.
+    changed = _registry_snapshot("BBB", signal_date="2026-09-21", sessions=8, r5=-0.30, x5=-0.40)
+    changed.loc[0, "issuer_cik"] = "456"
+    reg2 = update_forward_registry(changed, tmp_path, now_utc="2026-10-01T08:00:00Z")
+    b2 = reg2[reg2["ticker"].eq("BBB")].iloc[0]
+    assert abs(float(b2["excess_5"]) - 0.08) < 1e-12
+    assert abs(float(b2["return_5"]) - 0.12) < 1e-12
+
+
+def test_forward_registry_excludes_incomplete_context_and_is_idempotent(tmp_path):
+    incomplete = _registry_snapshot("AAA", context=False)
+    reg = update_forward_registry(incomplete, tmp_path, now_utc="2026-09-21T08:00:00Z")
+    assert reg.empty
+    complete = _registry_snapshot("AAA", context=True)
+    reg2 = update_forward_registry(complete, tmp_path, now_utc="2026-09-22T08:00:00Z")
+    reg3 = update_forward_registry(complete, tmp_path, now_utc="2026-09-23T08:00:00Z")
+    assert len(reg2) == 1 and len(reg3) == 1
+    assert reg2.iloc[0]["tracking_origin"] == "FORWARD"
+
+
+def test_forward_registry_summary_separates_origins(tmp_path):
+    base = _registry_snapshot("AAA", sessions=5, r5=0.10, x5=0.05)
+    update_forward_registry(base, tmp_path, now_utc="2026-09-21T08:00:00Z")
+    fwd = _registry_snapshot("BBB", signal_date="2026-09-21", sessions=5, r5=0.20, x5=0.10)
+    fwd.loc[0, "issuer_cik"] = "456"
+    reg = update_forward_registry(fwd, tmp_path, now_utc="2026-09-22T08:00:00Z")
+    summ = forward_registry_summary(reg)
+    assert set(summ["tracking_origin"]) == {"BASELINE", "FORWARD"}
+    f = summ[summ["tracking_origin"].eq("FORWARD")].iloc[0]
+    assert int(f["n_completed"]) == 1
+    assert abs(float(f["mean_excess_5_pct"]) - 10.0) < 1e-12
