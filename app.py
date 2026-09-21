@@ -23,7 +23,7 @@ from live_engine import (
     sync_live_sec,
 )
 
-VERSION = "1.2"
+VERSION = "1.3"
 STATE_DIR = Path("data/live_v1")
 paths = live_state_paths(STATE_DIR)
 paths["root"].mkdir(parents=True, exist_ok=True)
@@ -36,6 +36,12 @@ st.info(
     "Regole operative congelate: **WATCH = primo cluster ≥2 insider**, **CORE = primo cluster ≥3 insider**. "
     "Il tag **VALUE 100–250k (2026$)** è informativo e non elimina gli altri CORE. "
     "L'orizzonte empirico principale osservato nella ricerca è **5 sedute**."
+)
+
+st.success(
+    "**Uso quotidiano:** 1) Sync SEC fino a **Pendenti = 0** → 2) **Costruisci Radar** → "
+    "3) **Aggiorna prezzi** → 4) concentra l'attenzione su **NUOVI CORE + CORE ATTIVI**. "
+    "WATCH è una preallerta; COMPLETATI alimentano soprattutto il Forward Registry."
 )
 
 with st.sidebar:
@@ -55,6 +61,27 @@ with st.sidebar:
             st.rerun()
         except Exception as exc:
             st.error(f"Ripristino non riuscito: {exc}")
+
+    st.divider()
+    st.subheader("Uso quotidiano")
+    st.markdown(
+        """
+**1. Sync SEC**  
+Continua finché **Pendenti = 0**.
+
+**2. Costruisci Radar**  
+Aggiorna CORE e WATCH.
+
+**3. Aggiorna prezzi**  
+Aggiorna stato 0/5 → 5/5 e performance.
+
+**4. Guarda solo**  
+**NUOVI CORE + CORE ATTIVI**.
+
+Poi usa **TV** per il grafico TradingView o porta il ticker in ChatGPT per l'analisi grafica.
+        """
+    )
+    st.caption("CORE = priorità principale (≥3 insider). WATCH = preallerta (2 insider). COMPLETATI servono soprattutto al Forward Registry.")
 
 summary = state_summary(STATE_DIR)
 cols = st.columns(5)
@@ -204,6 +231,52 @@ if not view.empty:
     if context_only:
         filt = filt[filt["context_complete"].fillna(False).astype(bool)]
 
+    # Daily focus: only NEW + ACTIVE CORE, i.e. the signals the user should inspect first.
+    today_focus = filt[
+        filt["priority"].eq("CORE")
+        & filt["operational_bucket"].isin(["NUOVO", "ATTIVO"])
+    ].copy()
+    if not today_focus.empty:
+        bucket_rank = {"NUOVO": 0, "ATTIVO": 1}
+        today_focus["_bucket_rank"] = today_focus["operational_bucket"].map(bucket_rank).fillna(9)
+        today_focus["_sessions_rank"] = pd.to_numeric(today_focus.get("sessions_observed"), errors="coerce").fillna(-1)
+        today_focus = today_focus.sort_values(
+            ["_bucket_rank", "_sessions_rank", "signal_date", "n_insiders"],
+            ascending=[True, True, False, False],
+        )
+
+    st.subheader("🎯 DA GUARDARE OGGI")
+    st.caption(
+        "Questa è la lista principale: **solo NUOVI CORE e CORE ancora nella finestra 1–4/5 sedute**. "
+        "Il radar non è un segnale automatico di acquisto: usa **TV** per verificare il grafico e il contesto."
+    )
+    if today_focus.empty:
+        st.info("Nessun NUOVO CORE o CORE ATTIVO con i filtri correnti.")
+    else:
+        focus_cols = [c for c in [
+            "ticker", "issuer_name", "n_insiders", "day_5", "cluster_value",
+            "value_flag", "role_tag", "tradingview_url", "sec_url"
+        ] if c in today_focus.columns]
+        focus_show = today_focus[focus_cols].copy()
+        focus_cfg = {
+            "ticker": st.column_config.TextColumn("Ticker"),
+            "issuer_name": st.column_config.TextColumn("Società"),
+            "n_insiders": st.column_config.NumberColumn("Insider", format="%d"),
+            "day_5": st.column_config.TextColumn("Giorno"),
+            "cluster_value": st.column_config.NumberColumn("Valore", format="$ %.0f"),
+            "value_flag": st.column_config.TextColumn("VALUE"),
+            "role_tag": st.column_config.TextColumn("Ruoli"),
+            "tradingview_url": st.column_config.LinkColumn("TV", display_text="Apri TV"),
+            "sec_url": st.column_config.LinkColumn("SEC", display_text="SEC"),
+        }
+        st.dataframe(
+            focus_show,
+            use_container_width=True,
+            hide_index=True,
+            column_config=focus_cfg,
+            height=min(420, 74 + 35 * len(focus_show)),
+        )
+
     # Status summary: these are workflow states, not trading recommendations.
     status_counts = filt["operational_bucket"].value_counts()
     m = st.columns(5)
@@ -284,21 +357,21 @@ if not view.empty:
     d1.download_button(
         "Scarica radar completo CSV",
         data=full_export.to_csv(index=False).encode("utf-8"),
-        file_name="insider_live_radar_complete_v1_2.csv",
+        file_name="insider_live_radar_complete_v1_3.csv",
         mime="text/csv",
         use_container_width=True,
     )
     d2.download_button(
         "Scarica radar operativo CSV",
         data=operational_export.to_csv(index=False).encode("utf-8"),
-        file_name="insider_live_radar_operational_v1_2.csv",
+        file_name="insider_live_radar_operational_v1_3.csv",
         mime="text/csv",
         use_container_width=True,
     )
     d3.download_button(
         "Scarica vista filtrata CSV",
         data=filt.to_csv(index=False).encode("utf-8"),
-        file_name="insider_live_radar_filtered_v1_2.csv",
+        file_name="insider_live_radar_filtered_v1_3.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -306,13 +379,13 @@ if not view.empty:
     st.download_button(
         "Backup stato live ZIP",
         data=export_state_zip(STATE_DIR),
-        file_name="insider_live_state_v1_2.zip",
+        file_name="insider_live_state_v1_3.zip",
         mime="application/zip",
         use_container_width=True,
     )
 
 st.divider()
-st.header("Forward Registry — v1.2")
+st.header("Forward Registry — v1.3")
 registry = load_forward_registry(STATE_DIR)
 meta = load_forward_registry_meta(STATE_DIR)
 if registry.empty:
@@ -334,7 +407,7 @@ else:
     rcols[4].metric("Avvio registro", str(meta.get("initialized_at", "—"))[:10])
 
     st.caption(
-        "I segnali già presenti al primo avvio della v1.2 sono marcati **BASELINE** e restano separati dal vero test prospettico. "
+        "I segnali già presenti al primo avvio della v1.2/v1.3 sono marcati **BASELINE** e restano separati dal vero test prospettico. "
         "Solo i segnali comparsi successivamente sono **FORWARD**. Una volta raggiunte 5 sedute, Ret 5 ed Excess 5 vengono congelati e non riscritti dai refresh successivi."
     )
 
@@ -367,7 +440,7 @@ else:
     st.download_button(
         "Scarica Forward Registry CSV",
         data=reg.to_csv(index=False).encode("utf-8"),
-        file_name="insider_forward_registry_v1_2.csv",
+        file_name="insider_forward_registry_v1_3.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -376,7 +449,7 @@ st.divider()
 with st.expander("Metodo congelato e limiti"):
     st.markdown(
         """
-- **Forward Registry v1.2:** il primo avvio crea una BASELINE separata; soltanto i segnali successivi sono FORWARD. A 5 sedute il risultato viene congelato e non viene riscritto.
+- **Forward Registry v1.3:** il primo avvio crea una BASELINE separata; soltanto i segnali successivi sono FORWARD. A 5 sedute il risultato viene congelato e non viene riscritto.
 - **Fonte:** SEC EDGAR Form 4 originali. Il radar mantiene solo acquisti **P** di common/ordinary shares, acquisizione **A**, prezzo e quantità positivi.
 - **Attribuzione prudente:** filing con più reporting owner vengono scartati; vengono mantenuti Officer/Director; 10b5-1 viene escluso quando esplicitamente marcato.
 - **Componente minimo:** $10.000, come nella ricerca congelata.
@@ -385,7 +458,7 @@ with st.expander("Metodo congelato e limiti"):
 - **CORE:** primo episodio che raggiunge almeno 3 insider distinti.
 - **VALUE:** $100k–250k in dollari 2026 è un tag, non un filtro obbligatorio.
 - **Orizzonte empirico:** 5 sedute è risultato più robusto di 1 seduta nella replica storica; non implica che ogni segnale salirà.
-- **Stati v1.2:** NUOVO = nessuna seduta successiva ancora disponibile; ATTIVO = 1–4 sedute osservate; COMPLETATO = almeno 5 sedute; DA VERIFICARE = ticker/prezzo/storico non risolto; DA PREZZARE = snapshot Yahoo non ancora aggiornato.
+- **Stati v1.3:** NUOVO = nessuna seduta successiva ancora disponibile; ATTIVO = 1–4 sedute osservate; COMPLETATO = almeno 5 sedute; DA VERIFICARE = ticker/prezzo/storico non risolto; DA PREZZARE = snapshot Yahoo non ancora aggiornato.
 - **Prezzi:** Yahoo è usato soltanto per il contesto operativo; ticker mancanti/delistati possono non essere prezzabili.
 - **Live:** per non trasformare Streamlit in un crawler pesante, il sync recente è checkpointed e può richiedere più esecuzioni.
         """
