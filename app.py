@@ -402,7 +402,7 @@ if not view.empty:
     )
 
 st.divider()
-st.header("Forward Registry — v1.3.3")
+st.header("Forward Registry — v1.3.4")
 registry = load_forward_registry(STATE_DIR)
 meta = load_forward_registry_meta(STATE_DIR)
 if registry.empty:
@@ -424,7 +424,7 @@ else:
     rcols[4].metric("Avvio registro", str(meta.get("initialized_at", "—"))[:10])
 
     st.caption(
-        "I segnali già presenti al primo avvio della v1.2/v1.3/v1.3.1/v1.3.2/v1.3.3 sono marcati **BASELINE** e restano separati dal vero test prospettico. "
+        "I segnali già presenti al primo avvio della v1.2/v1.3/v1.3.1/v1.3.2/v1.3.4 sono marcati **BASELINE** e restano separati dal vero test prospettico. "
         "Solo i segnali comparsi successivamente sono **FORWARD**. Una volta raggiunte 5 sedute, Ret 5 ed Excess 5 vengono congelati e non riscritti dai refresh successivi."
     )
 
@@ -457,7 +457,7 @@ else:
     st.download_button(
         "Scarica Forward Registry CSV",
         data=reg.to_csv(index=False).encode("utf-8"),
-        file_name="insider_forward_registry_v1_3_3.csv",
+        file_name="insider_forward_registry_v1_3_4.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -466,7 +466,7 @@ st.divider()
 with st.expander("Metodo congelato e limiti"):
     st.markdown(
         """
-- **Forward Registry v1.3.3:** il primo avvio crea una BASELINE separata; soltanto i segnali successivi sono FORWARD. A 5 sedute il risultato viene congelato e non viene riscritto.
+- **Forward Registry v1.3.4:** il primo avvio crea una BASELINE separata; soltanto i segnali successivi sono FORWARD. A 5 sedute il risultato viene congelato e non viene riscritto.
 - **Fonte:** SEC EDGAR Form 4 originali. Il radar mantiene solo acquisti **P** di common/ordinary shares, acquisizione **A**, prezzo e quantità positivi.
 - **Attribuzione prudente:** filing con più reporting owner vengono scartati; vengono mantenuti Officer/Director; 10b5-1 viene escluso quando esplicitamente marcato.
 - **Componente minimo:** $10.000, come nella ricerca congelata.

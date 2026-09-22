@@ -818,6 +818,27 @@ def _safe_date_text(value) -> str:
     return "" if pd.isna(dt) else pd.Timestamp(dt).strftime("%Y-%m-%d")
 
 
+def _safe_date_timestamp(value):
+    """Return a timezone-naive normalized Timestamp for date-only registry fields."""
+    dt = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(dt):
+        return pd.NaT
+    return pd.Timestamp(dt).tz_convert(None).normalize()
+
+
+def _safe_utc_naive_timestamp(value):
+    """Normalize ISO/UTC timestamps to timezone-naive pandas Timestamp.
+
+    Streamlit Cloud can run pandas versions that reject assigning an ISO string
+    such as ``2026-09-22T14:44:38Z`` into a datetime64 column. Keeping registry
+    timestamp columns as actual Timestamp values avoids that dtype mismatch.
+    """
+    dt = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(dt):
+        return pd.NaT
+    return pd.Timestamp(dt).tz_convert(None)
+
+
 def _safe_num(value):
     x = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     return float(x) if pd.notna(x) and np.isfinite(x) else np.nan
@@ -840,8 +861,13 @@ def load_forward_registry(state_dir: str | Path) -> pd.DataFrame:
     for c in FORWARD_REGISTRY_COLUMNS:
         if c not in df.columns:
             df[c] = pd.NA
-    for c in ["signal_date", "entry_date", "latest_price_date", "completed_at", "exit_5_date"]:
-        df[c] = pd.to_datetime(df[c], errors="coerce")
+    for c in ["signal_date", "entry_date", "latest_price_date", "exit_5_date"]:
+        df[c] = pd.to_datetime(df[c], errors="coerce").dt.normalize()
+    # Timestamps can be written with a trailing Z (UTC). Parse them explicitly
+    # and remove timezone information so later assignments keep a homogeneous
+    # datetime64 dtype across pandas versions.
+    for c in ["registered_at", "last_seen_at", "completed_at"]:
+        df[c] = pd.to_datetime(df[c], errors="coerce", utc=True).dt.tz_convert(None)
     for c in ["n_insiders", "cluster_value", "entry_open", "latest_close", "sessions_observed",
               "current_return_since_entry", "current_excess_since_entry", "return_5", "excess_5"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -879,6 +905,12 @@ def update_forward_registry(snapshot: pd.DataFrame, state_dir: str | Path, *, no
     paths = live_state_paths(state_dir)
     paths["root"].mkdir(parents=True, exist_ok=True)
     now = now_utc or _utc_now_text()
+    now_ts = _safe_utc_naive_timestamp(now)
+    if pd.isna(now_ts):
+        # Defensive fallback: _utc_now_text() is always valid, but do not allow
+        # a malformed external now_utc value to corrupt the registry.
+        now = _utc_now_text()
+        now_ts = _safe_utc_naive_timestamp(now)
     meta = load_forward_registry_meta(state_dir)
     initialized = bool(meta.get("initialized_at"))
     if not initialized:
@@ -916,14 +948,14 @@ def update_forward_registry(snapshot: pd.DataFrame, state_dir: str | Path, *, no
         new_rows.append({
             "signal_key": key,
             "tracking_origin": origin_for_new,
-            "registered_at": now,
-            "last_seen_at": now,
+            "registered_at": now_ts,
+            "last_seen_at": now_ts,
             "registration_version": "1.2",
             "priority": str(row.get("priority", "")),
             "ticker": str(row.get("ticker", "") or ""),
             "issuer_cik": str(row.get("issuer_cik", "") or ""),
             "issuer_name": str(row.get("issuer_name", "") or ""),
-            "signal_date": _safe_date_text(row.get("signal_date")),
+            "signal_date": _safe_date_timestamp(row.get("signal_date")),
             "n_insiders": _safe_num(row.get("n_insiders")),
             "cluster_value": _safe_num(row.get("cluster_value")),
             "value_flag": str(row.get("value_flag", "") or ""),
@@ -932,9 +964,9 @@ def update_forward_registry(snapshot: pd.DataFrame, state_dir: str | Path, *, no
             "roles": str(row.get("roles", "") or ""),
             "sec_url": str(row.get("sec_url", "") or ""),
             "tradingview_url": str(row.get("tradingview_url", "") or ""),
-            "entry_date": _safe_date_text(row.get("entry_date")),
+            "entry_date": _safe_date_timestamp(row.get("entry_date")),
             "entry_open": _safe_num(row.get("entry_open")),
-            "latest_price_date": _safe_date_text(row.get("price_date")),
+            "latest_price_date": _safe_date_timestamp(row.get("price_date")),
             "latest_close": _safe_num(row.get("current_close")),
             "sessions_observed": _safe_num(row.get("sessions_observed")),
             "current_return_since_entry": _safe_num(row.get("return_since_entry")),
@@ -942,8 +974,8 @@ def update_forward_registry(snapshot: pd.DataFrame, state_dir: str | Path, *, no
             "price_status": str(row.get("price_status", "not_requested") or "not_requested"),
             "operational_bucket": str(row.get("operational_bucket", "") or ""),
             "frozen": False,
-            "completed_at": "",
-            "exit_5_date": _safe_date_text(row.get("exit_5_date")),
+            "completed_at": pd.NaT,
+            "exit_5_date": _safe_date_timestamp(row.get("exit_5_date")),
             "return_5": np.nan,
             "excess_5": np.nan,
         })
@@ -958,7 +990,7 @@ def update_forward_registry(snapshot: pd.DataFrame, state_dir: str | Path, *, no
         row = by_key.get(key)
         if row is None:
             continue
-        reg.at[i, "last_seen_at"] = now
+        reg.at[i, "last_seen_at"] = now_ts
         for dst, src in [
             ("entry_date", "entry_date"), ("entry_open", "entry_open"),
             ("latest_price_date", "price_date"), ("latest_close", "current_close"),
@@ -968,9 +1000,9 @@ def update_forward_registry(snapshot: pd.DataFrame, state_dir: str | Path, *, no
         ]:
             val = row.get(src)
             if dst.endswith("date"):
-                txt = _safe_date_text(val)
-                if txt:
-                    reg.at[i, dst] = txt
+                ts = _safe_date_timestamp(val)
+                if pd.notna(ts):
+                    reg.at[i, dst] = ts
             else:
                 num = _safe_num(val)
                 if np.isfinite(num):
@@ -984,10 +1016,10 @@ def update_forward_registry(snapshot: pd.DataFrame, state_dir: str | Path, *, no
         sessions = _safe_num(row.get("sessions_observed"))
         if (not already_frozen) and np.isfinite(r5) and np.isfinite(x5) and np.isfinite(sessions) and sessions >= 5:
             reg.at[i, "frozen"] = True
-            reg.at[i, "completed_at"] = now
-            exit_txt = _safe_date_text(row.get("exit_5_date"))
-            if exit_txt:
-                reg.at[i, "exit_5_date"] = exit_txt
+            reg.at[i, "completed_at"] = now_ts
+            exit_ts = _safe_date_timestamp(row.get("exit_5_date"))
+            if pd.notna(exit_ts):
+                reg.at[i, "exit_5_date"] = exit_ts
             reg.at[i, "return_5"] = r5
             reg.at[i, "excess_5"] = x5
             reg.at[i, "operational_bucket"] = "COMPLETATO"

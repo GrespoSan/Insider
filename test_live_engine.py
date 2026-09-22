@@ -168,3 +168,15 @@ def test_forward_registry_summary_separates_origins(tmp_path):
     f = summ[summ["tracking_origin"].eq("FORWARD")].iloc[0]
     assert int(f["n_completed"]) == 1
     assert abs(float(f["mean_excess_5_pct"]) - 10.0) < 1e-12
+
+
+def test_forward_registry_accepts_utc_z_timestamp_on_freeze(tmp_path):
+    """Regression: pandas must not reject ISO Z strings for datetime64 fields."""
+    update_forward_registry(_registry_snapshot("AAA"), tmp_path, now_utc="2026-09-21T14:44:38Z")
+    done = _registry_snapshot("BBB", signal_date="2026-09-22", sessions=5, r5=0.07, x5=0.04)
+    done.loc[0, "issuer_cik"] = "999"
+    reg = update_forward_registry(done, tmp_path, now_utc="2026-09-22T14:44:38Z")
+    row = reg[reg["ticker"].eq("BBB")].iloc[0]
+    assert bool(row["frozen"]) is True
+    assert pd.notna(row["completed_at"])
+    assert abs(float(row["return_5"]) - 0.07) < 1e-12
